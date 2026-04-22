@@ -28,6 +28,7 @@ class Mamba2MCLMHeadModel(nn.Module):
         segment_size: int = 64,
         max_cached_segments: int = 16,
         detach_cached_segments: bool = True,
+        min_history_segments: int = 1,
     ):
         super().__init__()
         self.args = args
@@ -35,6 +36,7 @@ class Mamba2MCLMHeadModel(nn.Module):
         self.segment_size = segment_size
         self.max_cached_segments = max_cached_segments
         self.detach_cached_segments = detach_cached_segments
+        self.min_history_segments = min_history_segments
 
         self.backbone = nn.ModuleDict(
             dict(
@@ -60,9 +62,10 @@ class Mamba2MCLMHeadModel(nn.Module):
 
         # Trainable matrix used to compute weighting ratios over cached hidden states.
         self.W = nn.Parameter(torch.empty(args.d_model, args.d_model, device=device))
-        nn.init.xavier_uniform_(self.W)
+        nn.init.eye_(self.W)
         # Scalar gate to blend current hidden state and cached weighted history.
-        self.online_bias = nn.Parameter(torch.zeros((), device=device))
+        # Start near identity behavior of base Mamba2 for stable fine-tuning.
+        self.online_bias = nn.Parameter(torch.tensor(8.0, device=device))
 
     def _forward_backbone_full(self, input_ids: LongTensor) -> tuple[Tensor, list[InferenceCache]]:
         """Fast path: run full-sequence backbone in parallel, mirroring Mamba2."""
@@ -83,6 +86,7 @@ class Mamba2MCLMHeadModel(nn.Module):
         segment_size: int = 64,
         max_cached_segments: int = 16,
         detach_cached_segments: bool = True,
+        min_history_segments: int = 1,
     ):
         try:
             from transformers.utils import CONFIG_NAME, WEIGHTS_NAME
@@ -119,6 +123,7 @@ class Mamba2MCLMHeadModel(nn.Module):
             segment_size=segment_size,
             max_cached_segments=max_cached_segments,
             detach_cached_segments=detach_cached_segments,
+            min_history_segments=min_history_segments,
         )
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
 
@@ -156,7 +161,7 @@ class Mamba2MCLMHeadModel(nn.Module):
         )
 
     def _weighted_history_mix(self, hidden_t: Tensor, cache: MCInferenceCache) -> Tensor:
-        if len(cache.segment_buffer) == 0:
+        if len(cache.segment_buffer) < self.min_history_segments:
             return hidden_t
 
         history = torch.stack(cache.segment_buffer, dim=1)  # (batch, n_seg, d_model)
@@ -234,7 +239,7 @@ class Mamba2MCLMHeadModel(nn.Module):
                 end = min(seqlen, start + self.segment_size)
                 hidden_chunk = hidden[:, start:end, :]  # (b, l_seg, d)
 
-                if len(segment_buffer) == 0:
+                if len(segment_buffer) < self.min_history_segments:
                     mixed_chunk = hidden_chunk
                 else:
                     history = torch.stack(segment_buffer, dim=1)  # (b, n_seg, d)

@@ -1,12 +1,15 @@
 import argparse
+import hashlib
+import json
 import math
 import os
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from datasets import Dataset, concatenate_datasets, load_dataset
+from datasets import Dataset, concatenate_datasets, load_dataset, load_from_disk
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -67,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-accum-steps", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=2e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--warmup-ratio", type=float, default=0.03)
+    parser.add_argument("--warmup-ratio", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--block-size", type=int, default=128, help="Should be a multiple of 64 for this model.")
     parser.add_argument(
@@ -100,7 +103,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of prefetched batches per DataLoader worker.",
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--log-every", type=int, default=20)
+    parser.add_argument(
+        "--log-every-data-points",
+        type=int,
+        default=200,
+        help="Print training loss/ppl every N processed data points.",
+    )
 
     parser.add_argument(
         "--wikitext-config",
@@ -114,6 +122,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Debug only. 0 means use full WikiText train split.",
     )
+    parser.add_argument(
+        "--wikitext-target-tokens",
+        type=int,
+        default=4_000_000,
+        help="Optional token cap for WikiText train text collection. 0 means no token cap.",
+    )
 
     parser.add_argument(
         "--fineweb-config",
@@ -122,10 +136,10 @@ def parse_args() -> argparse.Namespace:
         help="FineWeb subset/config to stream.",
     )
     parser.add_argument(
-        "--fineweb-target-mb",
+        "--fineweb-target-tokens",
         type=int,
-        default=100,
-        help="Target raw UTF-8 text size in MB (script avoids going over this cap).",
+        default=8_500_000,
+        help="Target number of tokenizer tokens to collect from FineWeb train stream.",
     )
     parser.add_argument(
         "--fineweb-max-stream-samples",
@@ -169,8 +183,13 @@ def tokenize_and_pack_text_dataset(text_dataset: Dataset, tokenizer, block_size:
         labels = [chunk.copy() for chunk in input_ids]
         return {"input_ids": input_ids, "labels": labels}
 
-    tokenized = text_dataset.map(tokenize_fn, batched=True, remove_columns=text_dataset.column_names)
-    packed = tokenized.map(group_texts, batched=True)
+    tokenized = text_dataset.map(
+        tokenize_fn,
+        batched=True,
+        remove_columns=text_dataset.column_names,
+        desc="Tokenizing text",
+    )
+    packed = tokenized.map(group_texts, batched=True, desc="Packing token blocks")
     packed.set_format(type="torch", columns=["input_ids", "labels"])
     return packed
 
@@ -189,12 +208,229 @@ def build_dataloader(dataset: Dataset, args, shuffle: bool) -> DataLoader:
     return DataLoader(dataset, **kwargs)
 
 
-def get_wikitext_loader(args, tokenizer) -> DataLoader:
+def _collection_cache_root(args) -> Path:
+    root = Path(args.cache_dir) / "text_collection_cache"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _collection_cache_key(spec: dict) -> str:
+    payload = json.dumps(spec, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _collection_cache_dir(args, spec: dict) -> Path:
+    source = str(spec.get("source", "dataset"))
+    split = str(spec.get("split", "train"))
+    key = _collection_cache_key(spec)
+    return _collection_cache_root(args) / f"{source}-{split}-{key}"
+
+
+def _load_cached_text_collection(args, spec: dict) -> Dataset | None:
+    cache_dir = _collection_cache_dir(args, spec)
+    meta_path = cache_dir / "meta.json"
+    data_dir = cache_dir / "dataset"
+    if not meta_path.exists() or not data_dir.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if meta.get("spec") != spec:
+            return None
+        dataset = load_from_disk(str(data_dir))
+        print(f"Loaded cached text collection from {cache_dir}")
+        return dataset
+    except Exception as exc:
+        print(f"Warning: failed to load cached text collection at {cache_dir}: {exc}")
+        return None
+
+
+def _save_cached_text_collection(args, spec: dict, dataset: Dataset) -> None:
+    cache_dir = _collection_cache_dir(args, spec)
+    data_dir = cache_dir / "dataset"
+    meta_path = cache_dir / "meta.json"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if data_dir.exists() and meta_path.exists():
+        print(f"Text collection cache already exists at {cache_dir}")
+        return
+    dataset.save_to_disk(str(data_dir))
+    meta = {
+        "spec": spec,
+        "num_rows": len(dataset),
+    }
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    print(f"Saved text collection cache to {cache_dir}")
+
+
+def _collect_texts_by_token_target(
+    text_iterable,
+    tokenizer,
+    target_tokens: int,
+    max_stream_samples: int = 0,
+    source_name: str = "dataset",
+):
+    texts = []
+    total_tokens = 0
+    total_items = None
+    progress_mode = "tokens" if target_tokens > 0 else "examples"
+    if target_tokens > 0:
+        total_items = target_tokens
+    elif max_stream_samples > 0:
+        total_items = max_stream_samples
+    else:
+        try:
+            total_items = len(text_iterable)
+        except TypeError:
+            total_items = None
+
+    print(f"Collecting {source_name}: start")
+    next_percent_to_print = 1
+    last_percent_printed = 0
+    next_checkpoint_docs = 10_000
+    processed_docs = 0
+
+    def maybe_print_percent():
+        nonlocal next_percent_to_print, last_percent_printed
+        if total_items is None or total_items <= 0:
+            return
+        progress_value = total_tokens if progress_mode == "tokens" else processed_docs
+        progress_pct = int((100 * progress_value) / total_items)
+        while next_percent_to_print <= 100 and progress_pct >= next_percent_to_print:
+            print(
+                f"Collecting {source_name}: {next_percent_to_print}% "
+                f"(docs={processed_docs}, tokens={total_tokens})"
+            )
+            last_percent_printed = next_percent_to_print
+            next_percent_to_print += 1
+
+    for i, sample in enumerate(text_iterable):
+        processed_docs += 1
+        text = sample.get("text", "")
+        if not text or text.isspace():
+            maybe_print_percent()
+            continue
+
+        token_count = len(tokenizer.encode(text, add_special_tokens=False))
+        if token_count == 0:
+            maybe_print_percent()
+            continue
+
+        if target_tokens > 0 and (total_tokens + token_count) > target_tokens:
+            break
+
+        texts.append(text)
+        total_tokens += token_count
+        maybe_print_percent()
+
+        if total_items is None and processed_docs >= next_checkpoint_docs:
+            print(
+                f"Collecting {source_name}: docs={processed_docs}, tokens={total_tokens}"
+            )
+            next_checkpoint_docs += 10_000
+
+        if max_stream_samples > 0 and (i + 1) >= max_stream_samples:
+            break
+
+    completed = False
+    if progress_mode == "tokens" and target_tokens > 0:
+        completed = total_tokens >= target_tokens
+    elif total_items is not None and total_items > 0:
+        completed = processed_docs >= total_items
+
+    if completed and total_items is not None and total_items > 0 and last_percent_printed < 100:
+        print(
+            f"Collecting {source_name}: 100% "
+            f"(docs={processed_docs}, tokens={total_tokens})"
+        )
+    else:
+        print(f"Collecting {source_name}: done (docs={processed_docs}, tokens={total_tokens})")
+    return texts, total_tokens
+
+
+def _build_wikitext_train_text_dataset(args, tokenizer) -> Dataset:
+    spec = {
+        "source": "wikitext",
+        "split": "train",
+        "wikitext_config": args.wikitext_config,
+        "max_train_samples_wikitext": args.max_train_samples_wikitext,
+        "wikitext_target_tokens": args.wikitext_target_tokens,
+        "tokenizer_id": args.tokenizer_id,
+    }
+    cached_dataset = _load_cached_text_collection(args, spec)
+    if cached_dataset is not None:
+        return cached_dataset
+
+    print("Loading WikiText train split...")
     dataset = load_dataset("Salesforce/wikitext", args.wikitext_config, split="train", cache_dir=args.cache_dir)
 
     if args.max_train_samples_wikitext > 0:
         dataset = dataset.select(range(min(args.max_train_samples_wikitext, len(dataset))))
 
+    if args.wikitext_target_tokens > 0:
+        print("Collecting WikiText documents to token target...")
+        texts, total_tokens = _collect_texts_by_token_target(
+            dataset,
+            tokenizer=tokenizer,
+            target_tokens=args.wikitext_target_tokens,
+            source_name="wikitext",
+        )
+        if not texts:
+            raise RuntimeError("No WikiText text was collected under --wikitext-target-tokens.")
+        print(
+            f"Collected WikiText slice: docs={len(texts)}, tokens={total_tokens} "
+            f"(cap={args.wikitext_target_tokens})"
+        )
+        dataset = Dataset.from_dict({"text": texts})
+
+    _save_cached_text_collection(args, spec, dataset)
+    return dataset
+
+
+def _build_fineweb_train_text_dataset(args, tokenizer) -> Dataset:
+    spec = {
+        "source": "fineweb",
+        "split": "train",
+        "fineweb_config": args.fineweb_config,
+        "fineweb_target_tokens": args.fineweb_target_tokens,
+        "fineweb_max_stream_samples": args.fineweb_max_stream_samples,
+        "tokenizer_id": args.tokenizer_id,
+    }
+    cached_dataset = _load_cached_text_collection(args, spec)
+    if cached_dataset is not None:
+        return cached_dataset
+
+    print("Loading FineWeb train stream...")
+    streamed = load_dataset(
+        "HuggingFaceFW/fineweb",
+        name=args.fineweb_config,
+        split="train",
+        streaming=True,
+        cache_dir=args.cache_dir,
+    )
+
+    print("Collecting FineWeb documents to token target...")
+    texts, total_tokens = _collect_texts_by_token_target(
+        streamed,
+        tokenizer=tokenizer,
+        target_tokens=args.fineweb_target_tokens,
+        max_stream_samples=args.fineweb_max_stream_samples,
+        source_name="fineweb",
+    )
+
+    if not texts:
+        raise RuntimeError("No FineWeb text was collected. Try another --fineweb-config or token target.")
+
+    print(
+        f"Collected FineWeb slice: docs={len(texts)}, tokens={total_tokens} "
+        f"(cap={args.fineweb_target_tokens})"
+    )
+    dataset = Dataset.from_dict({"text": texts})
+    _save_cached_text_collection(args, spec, dataset)
+    return dataset
+
+
+def get_wikitext_loader(args, tokenizer) -> DataLoader:
+    dataset = _build_wikitext_train_text_dataset(args, tokenizer)
+    print("Tokenizing and packing WikiText...")
     packed = tokenize_and_pack_text_dataset(dataset, tokenizer, args.block_size)
     return build_dataloader(packed, args, shuffle=True)
 
@@ -203,86 +439,20 @@ def get_wikitext_text_dataset(args) -> Dataset:
     dataset = load_dataset("Salesforce/wikitext", args.wikitext_config, split="train", cache_dir=args.cache_dir)
     if args.max_train_samples_wikitext > 0:
         dataset = dataset.select(range(min(args.max_train_samples_wikitext, len(dataset))))
+    if args.wikitext_target_tokens > 0:
+        raise ValueError("wikitext token targeting requires tokenizer; use get_wikitext_loader or get_mixed_loader.")
     return dataset
 
 
 def get_fineweb_loader(args, tokenizer) -> DataLoader:
-    target_bytes = args.fineweb_target_mb * 1024 * 1024
-    streamed = load_dataset(
-        "HuggingFaceFW/fineweb",
-        name=args.fineweb_config,
-        split="train",
-        streaming=True,
-        cache_dir=args.cache_dir,
-    )
-
-    texts = []
-    total_bytes = 0
-
-    for i, sample in enumerate(streamed):
-        text = sample.get("text", "")
-        if not text or text.isspace():
-            continue
-
-        text_bytes = len(text.encode("utf-8"))
-        if total_bytes + text_bytes > target_bytes:
-            break
-
-        texts.append(text)
-        total_bytes += text_bytes
-
-        if args.fineweb_max_stream_samples > 0 and (i + 1) >= args.fineweb_max_stream_samples:
-            break
-
-    if not texts:
-        raise RuntimeError("No FineWeb text was collected. Try another --fineweb-config.")
-
-    print(
-        f"Collected FineWeb slice: docs={len(texts)}, bytes={total_bytes} "
-        f"(~{total_bytes / (1024 * 1024):.2f} MB, cap={args.fineweb_target_mb} MB)"
-    )
-
-    text_dataset = Dataset.from_dict({"text": texts})
+    text_dataset = _build_fineweb_train_text_dataset(args, tokenizer)
+    print("Tokenizing and packing FineWeb...")
     packed = tokenize_and_pack_text_dataset(text_dataset, tokenizer, args.block_size)
     return build_dataloader(packed, args, shuffle=True)
 
 
 def get_fineweb_text_dataset(args) -> Dataset:
-    target_bytes = args.fineweb_target_mb * 1024 * 1024
-    streamed = load_dataset(
-        "HuggingFaceFW/fineweb",
-        name=args.fineweb_config,
-        split="train",
-        streaming=True,
-        cache_dir=args.cache_dir,
-    )
-
-    texts = []
-    total_bytes = 0
-
-    for i, sample in enumerate(streamed):
-        text = sample.get("text", "")
-        if not text or text.isspace():
-            continue
-
-        text_bytes = len(text.encode("utf-8"))
-        if total_bytes + text_bytes > target_bytes:
-            break
-
-        texts.append(text)
-        total_bytes += text_bytes
-
-        if args.fineweb_max_stream_samples > 0 and (i + 1) >= args.fineweb_max_stream_samples:
-            break
-
-    if not texts:
-        raise RuntimeError("No FineWeb text was collected. Try another --fineweb-config.")
-
-    print(
-        f"Collected FineWeb slice: docs={len(texts)}, bytes={total_bytes} "
-        f"(~{total_bytes / (1024 * 1024):.2f} MB, cap={args.fineweb_target_mb} MB)"
-    )
-    return Dataset.from_dict({"text": texts})
+    raise ValueError("fineweb token targeting requires tokenizer; use get_fineweb_loader or get_mixed_loader.")
 
 
 def get_wikitext_val_loader(args, tokenizer) -> DataLoader:
@@ -326,9 +496,9 @@ def get_mixed_loader(args, tokenizer, selected_datasets: list[str]) -> DataLoade
     text_datasets = []
 
     if "wikitext" in selected_datasets:
-        text_datasets.append(get_wikitext_text_dataset(args))
+        text_datasets.append(_build_wikitext_train_text_dataset(args, tokenizer))
     if "fineweb" in selected_datasets:
-        text_datasets.append(get_fineweb_text_dataset(args))
+        text_datasets.append(_build_fineweb_train_text_dataset(args, tokenizer))
 
     if not text_datasets:
         raise ValueError("No datasets selected for mixed training.")
@@ -338,6 +508,7 @@ def get_mixed_loader(args, tokenizer, selected_datasets: list[str]) -> DataLoade
     else:
         mixed_text_dataset = concatenate_datasets(text_datasets)
 
+    print("Tokenizing and packing mixed dataset...")
     packed = tokenize_and_pack_text_dataset(mixed_text_dataset, tokenizer, args.block_size)
     return build_dataloader(packed, args, shuffle=True)
 
@@ -429,21 +600,24 @@ def build_optimizer(model, args) -> AdamW:
     return AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
 
 
-def build_linear_warmup_scheduler(optimizer, warmup_steps: int, total_steps: int):
+def build_warmup_scheduler(optimizer, warmup_steps: int) -> LambdaLR:
+    if warmup_steps <= 0:
+        return LambdaLR(optimizer, lr_lambda=lambda _step: 1.0)
+
+    def lr_lambda(step: int) -> float:
+        if step >= warmup_steps:
+            return 1.0
+        return float(step + 1) / float(warmup_steps)
+
+    return LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def perplexity_from_loss(loss_value: float) -> float:
+    # Use the true perplexity from NLL loss; no artificial clipping.
     try:
-        from transformers import get_linear_schedule_with_warmup
-        return get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps,
-        )
-    except ImportError:
-        from transformers.optimization import WarmupLinearSchedule
-        return WarmupLinearSchedule(
-            optimizer,
-            warmup_steps=warmup_steps,
-            t_total=total_steps,
-        )
+        return math.exp(loss_value)
+    except OverflowError:
+        return float("inf")
 
 
 def save_data_point_checkpoint(
@@ -505,6 +679,7 @@ def train_one_epoch(
     stage_tag: str,
     epoch_idx: int,
     stage_epochs: int,
+    scheduler=None,
     val_loader=None,
 ) -> tuple[int, int, int]:
     model.train()
@@ -512,10 +687,13 @@ def train_one_epoch(
 
     num_batches = len(train_loader)
     updates_this_epoch = max(1, math.ceil(num_batches / args.grad_accum_steps))
-    warmup_steps = int(updates_this_epoch * args.warmup_ratio)
-    scheduler = build_linear_warmup_scheduler(optimizer, warmup_steps, updates_this_epoch)
-
     running_loss = torch.zeros((), device=device)
+    running_loss_batches = 0
+    next_train_log_checkpoint = None
+    if args.log_every_data_points > 0:
+        next_train_log_checkpoint = (
+            (data_points_seen // args.log_every_data_points) + 1
+        ) * args.log_every_data_points
     next_val_checkpoint = 1000
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
@@ -546,28 +724,41 @@ def train_one_epoch(
             )
         loss = loss / args.grad_accum_steps
         loss.backward()
+        # Keep logging in true per-batch loss units (not grad-accum scaled units).
         running_loss = running_loss + (loss.detach() * args.grad_accum_steps)
+        running_loss_batches += 1
 
         should_update = (step % args.grad_accum_steps == 0) or (step == num_batches)
         if should_update:
             torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
             optimizer.step()
-            scheduler.step()
+            if scheduler is not None:
+                scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
 
-            if global_step % args.log_every == 0:
-                avg_loss = float((running_loss / args.log_every).item())
-                ppl = math.exp(min(avg_loss, 20))
+        if (
+            next_train_log_checkpoint is not None
+            and data_points_seen >= next_train_log_checkpoint
+            and running_loss_batches > 0
+        ):
+            avg_loss = float((running_loss / running_loss_batches).item())
+            ppl = perplexity_from_loss(avg_loss)
+            if scheduler is not None:
                 lr = scheduler.get_last_lr()[0]
-                log_msg = (
-                    f"stage={stage_tag} dataset={dataset_tag} step={global_step} "
-                    f"loss={avg_loss:.4f} ppl={ppl:.2f} lr={lr:.2e}"
-                )
-                print(log_msg)
-                progress.set_postfix_str(f"loss={avg_loss:.4f}")
-                running_loss = torch.zeros((), device=device)
+            else:
+                lr = optimizer.param_groups[0]["lr"]
+            print(
+                f"stage={stage_tag} dataset={dataset_tag} step={global_step} "
+                f"data_points={data_points_seen} loss={avg_loss:.4f} "
+                f"ppl={ppl:.3e} lr={lr:.2e}"
+            )
+            progress.set_postfix_str(f"loss={avg_loss:.4f}")
+            running_loss = torch.zeros((), device=device)
+            running_loss_batches = 0
+            while data_points_seen >= next_train_log_checkpoint:
+                next_train_log_checkpoint += args.log_every_data_points
 
         if args.data_point_checkpoint_interval > 0:
             while data_points_seen >= next_data_point_checkpoint:
@@ -584,10 +775,10 @@ def train_one_epoch(
         # Validation every 1k datapoints
         if val_loader is not None and data_points_seen >= next_val_checkpoint:
             val_loss = evaluate(model, val_loader, device, args)
-            val_ppl = math.exp(min(val_loss, 20))
+            val_ppl = perplexity_from_loss(val_loss)
             print(
                 f"Validation | data_points={data_points_seen} "
-                f"loss={val_loss:.4f} ppl={val_ppl:.2f}"
+                f"loss={val_loss:.4f} ppl={val_ppl:.3e}"
             )
             next_val_checkpoint += 1000
             model.train()
@@ -607,6 +798,7 @@ def finetune_one_epoch_on_wikitext(
     stage_tag: str,
     epoch_idx: int,
     stage_epochs: int,
+    scheduler=None,
 ) -> tuple[int, int, int]:
     loader = get_wikitext_loader(args, tokenizer)
     return train_one_epoch(
@@ -623,6 +815,7 @@ def finetune_one_epoch_on_wikitext(
         stage_tag=stage_tag,
         epoch_idx=epoch_idx,
         stage_epochs=stage_epochs,
+        scheduler=scheduler,
     )
 
 
@@ -638,6 +831,7 @@ def finetune_one_epoch_on_fineweb(
     stage_tag: str,
     epoch_idx: int,
     stage_epochs: int,
+    scheduler=None,
 ) -> tuple[int, int, int]:
     loader = get_fineweb_loader(args, tokenizer)
     return train_one_epoch(
@@ -654,6 +848,7 @@ def finetune_one_epoch_on_fineweb(
         stage_tag=stage_tag,
         epoch_idx=epoch_idx,
         stage_epochs=stage_epochs,
+        scheduler=scheduler,
     )
 
 
@@ -698,10 +893,15 @@ def run_stage(
     data_points_seen: int,
     next_data_point_checkpoint: int,
 ) -> tuple[int, int, int]:
+    scheduler = None
     for epoch_idx in range(1, stage_epochs + 1):
         print(f"=== {stage_tag} epoch {epoch_idx}/{stage_epochs} ===")
         if args.dataset_strategy == "mix":
             mixed_loader = get_mixed_loader(args, tokenizer, selected_datasets)
+            if scheduler is None:
+                updates_this_epoch = max(1, math.ceil(len(mixed_loader) / args.grad_accum_steps))
+                warmup_steps = int(updates_this_epoch * args.warmup_ratio)
+                scheduler = build_warmup_scheduler(optimizer, warmup_steps)
             global_step, data_points_seen, next_data_point_checkpoint = train_one_epoch(
                 model,
                 tokenizer,
@@ -716,38 +916,41 @@ def run_stage(
                 stage_tag=stage_tag,
                 epoch_idx=epoch_idx,
                 stage_epochs=stage_epochs,
+                scheduler=scheduler,
             )
             save_stage_checkpoint(model, tokenizer, args, stage_tag, epoch_idx, "mixed")
         else:
             for dataset_name in selected_datasets:
                 if dataset_name == "wikitext":
-                    global_step, data_points_seen, next_data_point_checkpoint = finetune_one_epoch_on_wikitext(
-                        model,
-                        tokenizer,
-                        optimizer,
-                        device,
-                        args,
-                        global_step,
-                        data_points_seen,
-                        next_data_point_checkpoint,
-                        stage_tag,
-                        epoch_idx,
-                        stage_epochs,
-                    )
+                    loader = get_wikitext_loader(args, tokenizer)
+                    dataset_tag = "wikitext"
                 elif dataset_name == "fineweb":
-                    global_step, data_points_seen, next_data_point_checkpoint = finetune_one_epoch_on_fineweb(
-                        model,
-                        tokenizer,
-                        optimizer,
-                        device,
-                        args,
-                        global_step,
-                        data_points_seen,
-                        next_data_point_checkpoint,
-                        stage_tag,
-                        epoch_idx,
-                        stage_epochs,
-                    )
+                    loader = get_fineweb_loader(args, tokenizer)
+                    dataset_tag = "fineweb"
+                else:
+                    continue
+
+                if scheduler is None:
+                    updates_this_epoch = max(1, math.ceil(len(loader) / args.grad_accum_steps))
+                    warmup_steps = int(updates_this_epoch * args.warmup_ratio)
+                    scheduler = build_warmup_scheduler(optimizer, warmup_steps)
+
+                global_step, data_points_seen, next_data_point_checkpoint = train_one_epoch(
+                    model=model,
+                    tokenizer=tokenizer,
+                    train_loader=loader,
+                    optimizer=optimizer,
+                    device=device,
+                    args=args,
+                    global_step=global_step,
+                    data_points_seen=data_points_seen,
+                    next_data_point_checkpoint=next_data_point_checkpoint,
+                    dataset_tag=dataset_tag,
+                    stage_tag=stage_tag,
+                    epoch_idx=epoch_idx,
+                    stage_epochs=stage_epochs,
+                    scheduler=scheduler,
+                )
                 save_stage_checkpoint(model, tokenizer, args, stage_tag, epoch_idx, dataset_name)
     return global_step, data_points_seen, next_data_point_checkpoint
 
@@ -761,12 +964,22 @@ def main() -> None:
         raise ValueError("--mc-segment-size must be > 0.")
     if args.mc_segment_size > args.block_size:
         raise ValueError("--mc-segment-size should be <= --block-size.")
+    if args.model_type == "Mamba2MC" and args.freeze_epochs > 0 and args.mc_segment_size >= args.block_size:
+        raise ValueError(
+            "For Mamba2MC freeze stage, --mc-segment-size must be < --block-size so MC params influence logits."
+        )
     if args.mc_max_cached_segments < 0:
         raise ValueError("--mc-max-cached-segments must be >= 0.")
     if args.dataloader_num_workers < 0:
         raise ValueError("--dataloader-num-workers must be >= 0.")
     if args.dataloader_prefetch_factor <= 0:
         raise ValueError("--dataloader-prefetch-factor must be > 0.")
+    if args.log_every_data_points <= 0:
+        raise ValueError("--log-every-data-points must be > 0.")
+    if args.wikitext_target_tokens < 0:
+        raise ValueError("--wikitext-target-tokens must be >= 0.")
+    if args.fineweb_target_tokens <= 0:
+        raise ValueError("--fineweb-target-tokens must be > 0.")
 
     torch.manual_seed(args.seed)
     device = get_device()
