@@ -89,13 +89,22 @@ class Mamba2LMHeadModel(nn.Module):
         self.lm_head.weight = self.backbone.embedding.weight
 
     @staticmethod
-    def from_pretrained(huggingface_model_id: str, device: Device = None):
-        from transformers.utils import CONFIG_NAME, WEIGHTS_NAME
-        from transformers.utils.hub import cached_file
+    def from_pretrained(huggingface_model_id: str, device: Device = None, cache_dir: str = None): # Added cache_dir here
+        try:
+            from transformers.utils import CONFIG_NAME, WEIGHTS_NAME
+            from transformers.utils.hub import cached_file
+        except ImportError:
+            from transformers.file_utils import CONFIG_NAME, WEIGHTS_NAME, cached_path
 
-        config_path = cached_file(huggingface_model_id, CONFIG_NAME)
+            def cached_file(model_id: str, filename: str, cache_dir: str = None):
+                url = f"https://huggingface.co/{model_id}/resolve/main/{filename}"
+                return cached_path(url, cache_dir=cache_dir)
+
+        # Pass cache_dir into both cached_file calls
+        config_path = cached_file(huggingface_model_id, CONFIG_NAME, cache_dir=cache_dir) 
         assert config_path, "Failed to get huggingface config file"
-        state_dict_path = cached_file(huggingface_model_id, WEIGHTS_NAME)
+        
+        state_dict_path = cached_file(huggingface_model_id, WEIGHTS_NAME, cache_dir=cache_dir)
         assert state_dict_path, "Failed to get huggingface state dict file"
 
         config = json.load(open(config_path))
