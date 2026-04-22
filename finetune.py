@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from datasets import Dataset, concatenate_datasets, load_dataset
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 def get_device() -> torch.device:
@@ -104,7 +105,18 @@ def parse_args() -> argparse.Namespace:
         help="Optional safety cap on number of streamed docs; 0 disables.",
     )
 
-    parser.add_argument("--save-every", type=int, default=500, help="Save checkpoint every N optimizer steps.")
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="./checkpoints",
+        help="Directory for periodic data-point checkpoints.",
+    )
+    parser.add_argument(
+        "--data-point-checkpoint-interval",
+        type=int,
+        default=10000,
+        help="Save a checkpoint every N processed data points.",
+    )
     return parser.parse_args()
 
 
@@ -326,16 +338,41 @@ def build_linear_warmup_scheduler(optimizer, warmup_steps: int, total_steps: int
         )
 
 
+def save_data_point_checkpoint(
+    model,
+    tokenizer,
+    checkpoint_dir: str,
+    data_points_mark: int,
+    stage_tag: str,
+    epoch_idx: int,
+) -> None:
+    ckpt_dir = Path(checkpoint_dir) / f"data-points-{data_points_mark}"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), ckpt_dir / "pytorch_model.bin")
+    tokenizer.save_pretrained(ckpt_dir)
+    meta_path = ckpt_dir / "meta.txt"
+    meta_path.write_text(
+        f"stage={stage_tag}\nepoch={epoch_idx}\ndata_points={data_points_mark}\n",
+        encoding="utf-8",
+    )
+    print(f"Saved data-point checkpoint to {ckpt_dir}")
+
+
 def train_one_epoch(
     model,
+    tokenizer,
     train_loader,
     optimizer,
     device,
     args,
     global_step: int,
+    data_points_seen: int,
+    next_data_point_checkpoint: int,
     dataset_tag: str,
     stage_tag: str,
-) -> int:
+    epoch_idx: int,
+    stage_epochs: int,
+) -> tuple[int, int, int]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
@@ -351,9 +388,18 @@ def train_one_epoch(
         f"optimizer_updates={updates_this_epoch}"
     )
 
-    for step, batch in enumerate(train_loader, start=1):
+    progress = tqdm(
+        enumerate(train_loader, start=1),
+        total=num_batches,
+        desc=f"{stage_tag} {epoch_idx}/{stage_epochs} | {dataset_tag}",
+        leave=False,
+    )
+
+    for step, batch in progress:
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
+        batch_data_points = int(input_ids.size(0))
+        data_points_seen += batch_data_points
 
         logits, _ = model(input_ids)
         shift_logits = logits[:, :-1, :].contiguous()
@@ -390,23 +436,81 @@ def train_one_epoch(
                 )
                 running_loss = 0.0
 
-            if args.save_every > 0 and global_step % args.save_every == 0:
-                ckpt_dir = Path(args.output_dir) / f"step-{global_step}"
-                ckpt_dir.mkdir(parents=True, exist_ok=True)
-                torch.save(model.state_dict(), ckpt_dir / "pytorch_model.bin")
-                print(f"Saved checkpoint to {ckpt_dir}")
+        if args.data_point_checkpoint_interval > 0:
+            while data_points_seen >= next_data_point_checkpoint:
+                save_data_point_checkpoint(
+                    model=model,
+                    tokenizer=tokenizer,
+                    checkpoint_dir=args.checkpoint_dir,
+                    data_points_mark=next_data_point_checkpoint,
+                    stage_tag=stage_tag,
+                    epoch_idx=epoch_idx,
+                )
+                next_data_point_checkpoint += args.data_point_checkpoint_interval
 
-    return global_step
+    return global_step, data_points_seen, next_data_point_checkpoint
 
 
-def finetune_one_epoch_on_wikitext(model, tokenizer, optimizer, device, args, global_step: int, stage_tag: str) -> int:
+def finetune_one_epoch_on_wikitext(
+    model,
+    tokenizer,
+    optimizer,
+    device,
+    args,
+    global_step: int,
+    data_points_seen: int,
+    next_data_point_checkpoint: int,
+    stage_tag: str,
+    epoch_idx: int,
+    stage_epochs: int,
+) -> tuple[int, int, int]:
     loader = get_wikitext_loader(args, tokenizer)
-    return train_one_epoch(model, loader, optimizer, device, args, global_step, dataset_tag="wikitext", stage_tag=stage_tag)
+    return train_one_epoch(
+        model,
+        tokenizer,
+        loader,
+        optimizer,
+        device,
+        args,
+        global_step,
+        data_points_seen,
+        next_data_point_checkpoint,
+        dataset_tag="wikitext",
+        stage_tag=stage_tag,
+        epoch_idx=epoch_idx,
+        stage_epochs=stage_epochs,
+    )
 
 
-def finetune_one_epoch_on_fineweb(model, tokenizer, optimizer, device, args, global_step: int, stage_tag: str) -> int:
+def finetune_one_epoch_on_fineweb(
+    model,
+    tokenizer,
+    optimizer,
+    device,
+    args,
+    global_step: int,
+    data_points_seen: int,
+    next_data_point_checkpoint: int,
+    stage_tag: str,
+    epoch_idx: int,
+    stage_epochs: int,
+) -> tuple[int, int, int]:
     loader = get_fineweb_loader(args, tokenizer)
-    return train_one_epoch(model, loader, optimizer, device, args, global_step, dataset_tag="fineweb", stage_tag=stage_tag)
+    return train_one_epoch(
+        model,
+        tokenizer,
+        loader,
+        optimizer,
+        device,
+        args,
+        global_step,
+        data_points_seen,
+        next_data_point_checkpoint,
+        dataset_tag="fineweb",
+        stage_tag=stage_tag,
+        epoch_idx=epoch_idx,
+        stage_epochs=stage_epochs,
+    )
 
 
 def save_stage_checkpoint(model, tokenizer, args, stage_tag: str, epoch_idx: int, dataset_name: str) -> None:
@@ -427,34 +531,61 @@ def run_stage(
     stage_tag: str,
     stage_epochs: int,
     global_step: int,
-) -> int:
+    data_points_seen: int,
+    next_data_point_checkpoint: int,
+) -> tuple[int, int, int]:
     for epoch_idx in range(1, stage_epochs + 1):
         print(f"=== {stage_tag} epoch {epoch_idx}/{stage_epochs} ===")
         if args.dataset_strategy == "mix":
             mixed_loader = get_mixed_loader(args, tokenizer, selected_datasets)
-            global_step = train_one_epoch(
+            global_step, data_points_seen, next_data_point_checkpoint = train_one_epoch(
                 model,
+                tokenizer,
                 mixed_loader,
                 optimizer,
                 device,
                 args,
                 global_step,
+                data_points_seen,
+                next_data_point_checkpoint,
                 dataset_tag="mixed",
                 stage_tag=stage_tag,
+                epoch_idx=epoch_idx,
+                stage_epochs=stage_epochs,
             )
             save_stage_checkpoint(model, tokenizer, args, stage_tag, epoch_idx, "mixed")
         else:
             for dataset_name in selected_datasets:
                 if dataset_name == "wikitext":
-                    global_step = finetune_one_epoch_on_wikitext(
-                        model, tokenizer, optimizer, device, args, global_step, stage_tag
+                    global_step, data_points_seen, next_data_point_checkpoint = finetune_one_epoch_on_wikitext(
+                        model,
+                        tokenizer,
+                        optimizer,
+                        device,
+                        args,
+                        global_step,
+                        data_points_seen,
+                        next_data_point_checkpoint,
+                        stage_tag,
+                        epoch_idx,
+                        stage_epochs,
                     )
                 elif dataset_name == "fineweb":
-                    global_step = finetune_one_epoch_on_fineweb(
-                        model, tokenizer, optimizer, device, args, global_step, stage_tag
+                    global_step, data_points_seen, next_data_point_checkpoint = finetune_one_epoch_on_fineweb(
+                        model,
+                        tokenizer,
+                        optimizer,
+                        device,
+                        args,
+                        global_step,
+                        data_points_seen,
+                        next_data_point_checkpoint,
+                        stage_tag,
+                        epoch_idx,
+                        stage_epochs,
                     )
                 save_stage_checkpoint(model, tokenizer, args, stage_tag, epoch_idx, dataset_name)
-    return global_step
+    return global_step, data_points_seen, next_data_point_checkpoint
 
 
 def main() -> None:
@@ -483,6 +614,8 @@ def main() -> None:
     print(f"Selected datasets: {selected_datasets}")
 
     global_step = 0
+    data_points_seen = 0
+    next_data_point_checkpoint = args.data_point_checkpoint_interval
 
     if args.freeze_epochs > 0:
         policy_model_name, trainable_names, frozen_names = configure_stage1_trainability_by_model_name(model)
@@ -490,7 +623,7 @@ def main() -> None:
         print(f"Freeze stage trainable params count: {len(trainable_names)}")
         print(f"Freeze stage frozen params count: {len(frozen_names)}")
         optimizer = build_optimizer(model, args)
-        global_step = run_stage(
+        global_step, data_points_seen, next_data_point_checkpoint = run_stage(
             model=model,
             tokenizer=tokenizer,
             optimizer=optimizer,
@@ -500,13 +633,15 @@ def main() -> None:
             stage_tag="freeze",
             stage_epochs=args.freeze_epochs,
             global_step=global_step,
+            data_points_seen=data_points_seen,
+            next_data_point_checkpoint=next_data_point_checkpoint,
         )
 
     if args.full_finetune_epochs > 0:
         unfreeze_all_params(model)
         print("Unfroze all model parameters for full fine-tuning stage.")
         optimizer = build_optimizer(model, args)
-        global_step = run_stage(
+        global_step, data_points_seen, next_data_point_checkpoint = run_stage(
             model=model,
             tokenizer=tokenizer,
             optimizer=optimizer,
@@ -516,6 +651,8 @@ def main() -> None:
             stage_tag="full",
             stage_epochs=args.full_finetune_epochs,
             global_step=global_step,
+            data_points_seen=data_points_seen,
+            next_data_point_checkpoint=next_data_point_checkpoint,
         )
 
     final_dir = Path(args.output_dir) / "final"
