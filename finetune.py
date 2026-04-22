@@ -12,6 +12,7 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 def get_device() -> torch.device:
+    breakpoint()
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():

@@ -258,6 +258,43 @@ class Mamba2MCLMHeadModel(nn.Module):
             for _ in range(self.args.n_layer)
         ]
 
+    def forward(
+        self, input_ids: LongTensor, h: list[MCLayerCache] | list[None] | None = None
+    ) -> tuple[Tensor, list[MCLayerCache]]:
+        """
+        Arguments
+            input_ids: (batch, seqlen) tokens from `EleutherAI/gpt-neox-20b` tokenizer
+            h: hidden states for inference step. If present, `input_ids` should
+               have shape (batch, 1) containing the next token.
+
+        Return (logits, h)
+            logits: (batch, seqlen, vocab_size)
+            h: updated MC cache after processing `input_ids`
+        """
+        batch_size, seqlen = input_ids.shape
+
+        if h is None:
+            caches: list[MCLayerCache] = self.alloc_cache(batch_size)
+        else:
+            if len(h) != self.args.n_layer:
+                raise ValueError(
+                    f"Expected {self.args.n_layer} layer caches, got {len(h)}"
+                )
+
+            base_caches = self.alloc_cache(batch_size)
+            caches = [
+                base_caches[i] if layer_cache is None else layer_cache
+                for i, layer_cache in enumerate(h)
+            ]
+
+        logits_steps: list[Tensor] = []
+        for t in range(seqlen):
+            step_logits, caches = self.step(input_ids[:, t : t + 1], caches)
+            logits_steps.append(step_logits)
+
+        logits = torch.cat(logits_steps, dim=1)
+        return logits[:, :seqlen], caches
+
     def step(
         self, input_ids: LongTensor, h: list[MCLayerCache]
     ) -> tuple[Tensor, list[MCLayerCache]]:
