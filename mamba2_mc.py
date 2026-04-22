@@ -64,6 +64,17 @@ class Mamba2MCLMHeadModel(nn.Module):
         # Scalar gate to blend current hidden state and cached weighted history.
         self.online_bias = nn.Parameter(torch.zeros((), device=device))
 
+    def _forward_backbone_full(self, input_ids: LongTensor) -> tuple[Tensor, list[InferenceCache]]:
+        """Fast path: run full-sequence backbone in parallel, mirroring Mamba2."""
+        x = self.backbone.embedding(input_ids)
+        layer_caches: list[InferenceCache] = []
+        for layer in self.backbone.layers:
+            y, layer_cache = layer.mixer(layer.norm(x), None)
+            x = x + y
+            layer_caches.append(layer_cache)
+        x = self.backbone.norm_f(x)
+        return x, layer_caches
+
     @staticmethod
     def from_pretrained(
         huggingface_model_id: str,
@@ -203,14 +214,75 @@ class Mamba2MCLMHeadModel(nn.Module):
         cache: MCInferenceCache | None = None,
     ) -> tuple[Tensor, MCInferenceCache]:
         batch_size, seqlen = input_ids.shape
+        # Fast training/eval path: no external cache and chunk-aligned sequence.
+        # This preserves Mamba2's parallel backbone execution speed.
+        if cache is None and seqlen % self.args.chunk_size == 0:
+            hidden, layer_caches = self._forward_backbone_full(input_ids)  # (b, l, d)
+
+            segment_buffer: list[Tensor] = []
+            current_segment_sum = torch.zeros(
+                batch_size,
+                self.args.d_model,
+                device=hidden.device,
+                dtype=hidden.dtype,
+            )
+            current_segment_len = 0
+            gate = torch.sigmoid(self.online_bias)
+            logits_chunks = []
+
+            for start in range(0, seqlen, self.segment_size):
+                end = min(seqlen, start + self.segment_size)
+                hidden_chunk = hidden[:, start:end, :]  # (b, l_seg, d)
+
+                if len(segment_buffer) == 0:
+                    mixed_chunk = hidden_chunk
+                else:
+                    history = torch.stack(segment_buffer, dim=1)  # (b, n_seg, d)
+                    query = torch.matmul(hidden_chunk, self.W)  # (b, l_seg, d)
+                    scores = (
+                        torch.einsum("bld,bnd->bln", query, history)
+                        / math.sqrt(self.args.d_model)
+                    )
+                    ratios = F.softmax(scores, dim=-1)
+                    weighted_hist = torch.einsum("bln,bnd->bld", ratios, history)
+                    mixed_chunk = gate * hidden_chunk + (1.0 - gate) * weighted_hist
+
+                logits_chunks.append(self.lm_head(mixed_chunk))
+
+                # Update segment cache state for compatibility with returned cache semantics.
+                for pos in range(hidden_chunk.shape[1]):
+                    hidden_t = hidden_chunk[:, pos, :]
+                    current_segment_sum = current_segment_sum + hidden_t
+                    current_segment_len += 1
+                    if current_segment_len >= self.segment_size:
+                        segment_hidden = current_segment_sum / float(current_segment_len)
+                        if self.detach_cached_segments:
+                            segment_hidden = segment_hidden.detach()
+                        segment_buffer.append(segment_hidden)
+                        if (
+                            self.max_cached_segments > 0
+                            and len(segment_buffer) > self.max_cached_segments
+                        ):
+                            segment_buffer = segment_buffer[-self.max_cached_segments :]
+                        current_segment_sum = torch.zeros_like(current_segment_sum)
+                        current_segment_len = 0
+
+            logits = torch.cat(logits_chunks, dim=1)
+            final_cache = MCInferenceCache(
+                layer_caches=layer_caches,
+                segment_buffer=segment_buffer,
+                current_segment_sum=current_segment_sum,
+                current_segment_len=current_segment_len,
+            )
+            return logits, final_cache
+
+        # Fallback path for incremental inference or non-chunk-aligned sequences.
         if cache is None:
             cache = self.alloc_cache(batch_size=batch_size)
-
         step_logits = []
         for pos in range(seqlen):
             logits_t, cache = self.step(input_ids[:, pos : pos + 1], cache)
             step_logits.append(logits_t)
-
         logits = torch.cat(step_logits, dim=1)
         return logits, cache
 
