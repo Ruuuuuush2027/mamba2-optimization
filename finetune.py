@@ -242,6 +242,43 @@ def get_fineweb_text_dataset(args) -> Dataset:
     return Dataset.from_dict({"text": texts})
 
 
+def get_wikitext_val_loader(args, tokenizer) -> DataLoader:
+    dataset = load_dataset("Salesforce/wikitext", args.wikitext_config, split="validation", cache_dir=args.cache_dir)
+    packed = tokenize_and_pack_text_dataset(dataset, tokenizer, args.block_size)
+    return DataLoader(packed, batch_size=args.batch_size, shuffle=False)
+
+
+def get_fineweb_val_loader(args, tokenizer) -> DataLoader:
+    # For fineweb validation, use a small fixed subset
+    target_bytes = 50 * 1024 * 1024  # 50MB for validation
+    streamed = load_dataset(
+        "HuggingFaceFW/fineweb",
+        name=args.fineweb_config,
+        split="train",
+        streaming=True,
+        cache_dir=args.cache_dir,
+    )
+
+    texts = []
+    total_bytes = 0
+    for i, sample in enumerate(streamed):
+        text = sample.get("text", "")
+        if not text or text.isspace():
+            continue
+        text_bytes = len(text.encode("utf-8"))
+        if total_bytes + text_bytes > target_bytes:
+            break
+        texts.append(text)
+        total_bytes += text_bytes
+
+    if not texts:
+        raise RuntimeError("No FineWeb validation text was collected.")
+
+    text_dataset = Dataset.from_dict({"text": texts})
+    packed = tokenize_and_pack_text_dataset(text_dataset, tokenizer, args.block_size)
+    return DataLoader(packed, batch_size=args.batch_size, shuffle=False)
+
+
 def get_mixed_loader(args, tokenizer, selected_datasets: list[str]) -> DataLoader:
     text_datasets = []
 
@@ -279,14 +316,15 @@ def configure_stage1_trainability_by_model_name(model) -> tuple[str, list[str], 
         # Current request: for the current Mamba2 model, keep all params trainable.
         for _, param in model.named_parameters():
             param.requires_grad = True
-    elif model_name == "YourFutureModelClass":
-        # Template for future model-specific freezing rules:
-        # for name, param in model.named_parameters():
-        #     if name.startswith("backbone"):
-        #         param.requires_grad = False
-        #     else:
-        #         param.requires_grad = True
-        pass
+    elif model_name == "Mamba2MCLMHeadModel":
+        # Freeze all original model parameters, only train MC-specific params (W_u and online_bias).
+        for name, param in model.named_parameters():
+            if "W_u" in name or "online_bias" in name:
+                # MC-specific params: trainable
+                param.requires_grad = True
+            else:
+                # Original model params: frozen
+                param.requires_grad = False
     else:
         # pass for all other model names: leave requires_grad unchanged.
         pass
@@ -307,7 +345,14 @@ def load_mamba2_model(model_id: str, device, cache_dir: str):
     return Mamba2LMHeadModel.from_pretrained(model_id, device=device, cache_dir=cache_dir)
 
 def load_our_model(model_id: str, device, cache_dir: str):
-    pass
+    try:
+        from mamba2_mc import Mamba2MCLMHeadModel
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Failed to import mamba2_mc dependencies. Install requirements first: pip install -r requirements.txt"
+        ) from exc
+
+    return Mamba2MCLMHeadModel.from_pretrained(model_id, device=device, cache_dir=cache_dir)
 
 def unfreeze_all_params(model) -> None:
     for _, param in model.named_parameters():
@@ -372,6 +417,7 @@ def train_one_epoch(
     stage_tag: str,
     epoch_idx: int,
     stage_epochs: int,
+    val_loader=None,
 ) -> tuple[int, int, int]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -382,6 +428,7 @@ def train_one_epoch(
     scheduler = build_linear_warmup_scheduler(optimizer, warmup_steps, updates_this_epoch)
 
     running_loss = 0.0
+    next_val_checkpoint = 1000
 
     print(
         f"Training 1 epoch | stage={stage_tag} dataset={dataset_tag}: batches={num_batches}, "
@@ -430,10 +477,12 @@ def train_one_epoch(
                 avg_loss = running_loss / args.log_every
                 ppl = math.exp(min(avg_loss, 20))
                 lr = scheduler.get_last_lr()[0]
-                print(
+                log_msg = (
                     f"stage={stage_tag} dataset={dataset_tag} step={global_step} "
                     f"loss={avg_loss:.4f} ppl={ppl:.2f} lr={lr:.2e}"
                 )
+                print(log_msg)
+                progress.set_postfix_str(f"loss={avg_loss:.4f}")
                 running_loss = 0.0
 
         if args.data_point_checkpoint_interval > 0:
@@ -447,6 +496,17 @@ def train_one_epoch(
                     epoch_idx=epoch_idx,
                 )
                 next_data_point_checkpoint += args.data_point_checkpoint_interval
+
+        # Validation every 1k datapoints
+        if val_loader is not None and data_points_seen >= next_val_checkpoint:
+            val_loss = evaluate(model, val_loader, device, args)
+            val_ppl = math.exp(min(val_loss, 20))
+            print(
+                f"Validation | data_points={data_points_seen} "
+                f"loss={val_loss:.4f} ppl={val_ppl:.2f}"
+            )
+            next_val_checkpoint += 1000
+            model.train()
 
     return global_step, data_points_seen, next_data_point_checkpoint
 
@@ -511,6 +571,34 @@ def finetune_one_epoch_on_fineweb(
         epoch_idx=epoch_idx,
         stage_epochs=stage_epochs,
     )
+
+
+def evaluate(model, val_loader, device, args) -> float:
+    """Evaluate model on validation dataset. Returns average loss."""
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+
+    with torch.no_grad():
+        for batch in tqdm(val_loader, desc="Evaluating", leave=False):
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+
+            logits, _ = model(input_ids)
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+            total_loss += loss.item()
+            num_batches += 1
+
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    model.train()
+    return avg_loss
 
 
 def save_stage_checkpoint(model, tokenizer, args, stage_tag: str, epoch_idx: int, dataset_name: str) -> None:
@@ -604,9 +692,11 @@ def main() -> None:
     if args.model_type == 'Mamba2':
         print("Loading Mamba2")
         model = load_mamba2_model(args.model_id, device=device, cache_dir=args.cache_dir)
-    else:
+    elif args.model_type == 'Mamba2MC':
         print("Loading Ours")
         model = load_our_model(args.model_id, device=device, cache_dir=args.cache_dir)
+    else:
+        raise ValueError(f"Unsupported model type: {args.model_type}")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_id, cache_dir=args.cache_dir)
     tokenizer.pad_token = tokenizer.eos_token
 
