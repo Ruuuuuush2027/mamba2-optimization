@@ -12,7 +12,6 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 def get_device() -> torch.device:
-    breakpoint()
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
@@ -64,13 +63,49 @@ def parse_args() -> argparse.Namespace:
         help="Stage-2 epochs: unfreeze all params and fine-tune end-to-end.",
     )
 
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accum-steps", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=2e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--block-size", type=int, default=256, help="Should be a multiple of 64 for this model.")
+    parser.add_argument("--block-size", type=int, default=128, help="Should be a multiple of 64 for this model.")
+    parser.add_argument(
+        "--mc-segment-size",
+        type=int,
+        default=64,
+        help="Segment length for Mamba2MC cache boundaries. Use < block-size so MC params affect logits during freeze stage.",
+    )
+    parser.add_argument(
+        "--mc-max-cached-segments",
+        type=int,
+        default=16,
+        help="Keep only the latest X cached segments in Mamba2MC. 0 means keep all.",
+    )
+    parser.add_argument(
+        "--mc-backprop-history",
+        action="store_true",
+        help="Backpropagate through historical cached segments. Disabled by default for better speed and memory.",
+    )
+    parser.add_argument(
+        "--mc-train-mode",
+        type=str,
+        choices=["throughput", "memory"],
+        default="throughput",
+        help="throughput: one backward per batch (faster, more memory). memory: token-streaming backward (slower, lower memory).",
+    )
+    parser.add_argument(
+        "--dataloader-num-workers",
+        type=int,
+        default=4,
+        help="Number of DataLoader workers.",
+    )
+    parser.add_argument(
+        "--dataloader-prefetch-factor",
+        type=int,
+        default=4,
+        help="Number of prefetched batches per DataLoader worker.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-every", type=int, default=20)
 
@@ -96,7 +131,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fineweb-target-mb",
         type=int,
-        default=300,
+        default=100,
         help="Target raw UTF-8 text size in MB (script avoids going over this cap).",
     )
     parser.add_argument(
@@ -147,6 +182,20 @@ def tokenize_and_pack_text_dataset(text_dataset: Dataset, tokenizer, block_size:
     return packed
 
 
+def build_dataloader(dataset: Dataset, args, shuffle: bool) -> DataLoader:
+    use_cuda = torch.cuda.is_available()
+    kwargs = {
+        "batch_size": args.batch_size,
+        "shuffle": shuffle,
+        "num_workers": args.dataloader_num_workers,
+        "pin_memory": use_cuda,
+    }
+    if args.dataloader_num_workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = args.dataloader_prefetch_factor
+    return DataLoader(dataset, **kwargs)
+
+
 def get_wikitext_loader(args, tokenizer) -> DataLoader:
     dataset = load_dataset("Salesforce/wikitext", args.wikitext_config, split="train", cache_dir=args.cache_dir)
 
@@ -154,7 +203,7 @@ def get_wikitext_loader(args, tokenizer) -> DataLoader:
         dataset = dataset.select(range(min(args.max_train_samples_wikitext, len(dataset))))
 
     packed = tokenize_and_pack_text_dataset(dataset, tokenizer, args.block_size)
-    return DataLoader(packed, batch_size=args.batch_size, shuffle=True)
+    return build_dataloader(packed, args, shuffle=True)
 
 
 def get_wikitext_text_dataset(args) -> Dataset:
@@ -202,7 +251,7 @@ def get_fineweb_loader(args, tokenizer) -> DataLoader:
 
     text_dataset = Dataset.from_dict({"text": texts})
     packed = tokenize_and_pack_text_dataset(text_dataset, tokenizer, args.block_size)
-    return DataLoader(packed, batch_size=args.batch_size, shuffle=True)
+    return build_dataloader(packed, args, shuffle=True)
 
 
 def get_fineweb_text_dataset(args) -> Dataset:
@@ -246,7 +295,7 @@ def get_fineweb_text_dataset(args) -> Dataset:
 def get_wikitext_val_loader(args, tokenizer) -> DataLoader:
     dataset = load_dataset("Salesforce/wikitext", args.wikitext_config, split="validation", cache_dir=args.cache_dir)
     packed = tokenize_and_pack_text_dataset(dataset, tokenizer, args.block_size)
-    return DataLoader(packed, batch_size=args.batch_size, shuffle=False)
+    return build_dataloader(packed, args, shuffle=False)
 
 
 def get_fineweb_val_loader(args, tokenizer) -> DataLoader:
@@ -277,7 +326,7 @@ def get_fineweb_val_loader(args, tokenizer) -> DataLoader:
 
     text_dataset = Dataset.from_dict({"text": texts})
     packed = tokenize_and_pack_text_dataset(text_dataset, tokenizer, args.block_size)
-    return DataLoader(packed, batch_size=args.batch_size, shuffle=False)
+    return build_dataloader(packed, args, shuffle=False)
 
 
 def get_mixed_loader(args, tokenizer, selected_datasets: list[str]) -> DataLoader:
@@ -297,7 +346,7 @@ def get_mixed_loader(args, tokenizer, selected_datasets: list[str]) -> DataLoade
         mixed_text_dataset = concatenate_datasets(text_datasets)
 
     packed = tokenize_and_pack_text_dataset(mixed_text_dataset, tokenizer, args.block_size)
-    return DataLoader(packed, batch_size=args.batch_size, shuffle=True)
+    return build_dataloader(packed, args, shuffle=True)
 
 
 def normalize_dataset_choice(train_datasets: list[str]) -> list[str]:
@@ -310,6 +359,16 @@ def normalize_dataset_choice(train_datasets: list[str]) -> list[str]:
     return ordered
 
 
+def _is_mc_specific_trainable_param(name: str) -> bool:
+    """Return True for MC-only params intended to train during freeze stage."""
+    return (
+        name == "W"
+        or name.endswith(".W")
+        or "W_u" in name
+        or "online_bias" in name
+    )
+
+
 def configure_stage1_trainability_by_model_name(model) -> tuple[str, list[str], list[str]]:
     model_name = model.__class__.__name__
 
@@ -318,14 +377,10 @@ def configure_stage1_trainability_by_model_name(model) -> tuple[str, list[str], 
         for _, param in model.named_parameters():
             param.requires_grad = True
     elif model_name == "Mamba2MCLMHeadModel":
-        # Freeze all original model parameters, only train MC-specific params (W_u and online_bias).
+        # Freeze original model parameters, train only MC-specific params.
+        # Supports both legacy MC param names and current state-only MC `W`.
         for name, param in model.named_parameters():
-            if "W_u" in name or "online_bias" in name:
-                # MC-specific params: trainable
-                param.requires_grad = True
-            else:
-                # Original model params: frozen
-                param.requires_grad = False
+            param.requires_grad = _is_mc_specific_trainable_param(name)
     else:
         # pass for all other model names: leave requires_grad unchanged.
         pass
@@ -345,7 +400,14 @@ def load_mamba2_model(model_id: str, device, cache_dir: str):
 
     return Mamba2LMHeadModel.from_pretrained(model_id, device=device, cache_dir=cache_dir)
 
-def load_our_model(model_id: str, device, cache_dir: str):
+def load_our_model(
+    model_id: str,
+    device,
+    cache_dir: str,
+    segment_size: int,
+    max_cached_segments: int,
+    detach_cached_segments: bool,
+):
     try:
         from mamba2_mc import Mamba2MCLMHeadModel
     except ModuleNotFoundError as exc:
@@ -353,7 +415,14 @@ def load_our_model(model_id: str, device, cache_dir: str):
             "Failed to import mamba2_mc dependencies. Install requirements first: pip install -r requirements.txt"
         ) from exc
 
-    return Mamba2MCLMHeadModel.from_pretrained(model_id, device=device, cache_dir=cache_dir)
+    return Mamba2MCLMHeadModel.from_pretrained(
+        model_id,
+        device=device,
+        cache_dir=cache_dir,
+        segment_size=segment_size,
+        max_cached_segments=max_cached_segments,
+        detach_cached_segments=detach_cached_segments,
+    )
 
 def unfreeze_all_params(model) -> None:
     for _, param in model.named_parameters():
@@ -404,6 +473,106 @@ def save_data_point_checkpoint(
     print(f"Saved data-point checkpoint to {ckpt_dir}")
 
 
+def _is_mc_model(model) -> bool:
+    return model.__class__.__name__ == "Mamba2MCLMHeadModel"
+
+
+def _is_mc_only_trainable(model) -> bool:
+    if not _is_mc_model(model):
+        return False
+    for name, param in model.named_parameters():
+        if param.requires_grad and not _is_mc_specific_trainable_param(name):
+            return False
+    return True
+
+
+def compute_batch_loss(model, input_ids, labels) -> torch.Tensor:
+    """Compute autoregressive CE loss; uses streamed-token path for Mamba2MC to save memory."""
+    if not _is_mc_model(model):
+        logits, _ = model(input_ids)
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        return F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
+
+    batch_size, seqlen = input_ids.shape
+    if seqlen < 2:
+        raise ValueError("Input sequence length must be at least 2 for autoregressive loss.")
+
+    caches = model.alloc_cache(batch_size=batch_size)
+    total_nll = torch.zeros((), device=input_ids.device)
+    total_valid_tokens = (labels[:, 1:] != -100).sum()
+    if int(total_valid_tokens.item()) == 0:
+        raise RuntimeError("No valid tokens available to compute loss.")
+
+    for pos in range(seqlen - 1):
+        step_logits, caches = model.step(input_ids[:, pos : pos + 1], caches)
+        step_targets = labels[:, pos + 1]
+
+        step_nll = F.cross_entropy(
+            step_logits.squeeze(1),
+            step_targets,
+            ignore_index=-100,
+            reduction="sum",
+        )
+
+        total_nll = total_nll + step_nll
+
+    return total_nll / total_valid_tokens.to(total_nll.dtype)
+
+
+def backward_batch_loss_mc_streaming(
+    model,
+    input_ids,
+    labels,
+    grad_accum_steps: int,
+) -> torch.Tensor:
+    """Memory-efficient MC freeze-stage loss/backward: backprop each token immediately."""
+    batch_size, seqlen = input_ids.shape
+    if seqlen < 2:
+        raise ValueError("Input sequence length must be at least 2 for autoregressive loss.")
+
+    caches = model.alloc_cache(batch_size=batch_size)
+    total_valid_tokens = (labels[:, 1:] != -100).sum()
+    if int(total_valid_tokens.item()) == 0:
+        raise RuntimeError("No valid tokens available to compute loss.")
+
+    total_loss_value = torch.zeros((), device=input_ids.device)
+    any_grad_step = False
+
+    for pos in range(seqlen - 1):
+        step_logits, caches = model.step(input_ids[:, pos : pos + 1], caches)
+        step_targets = labels[:, pos + 1]
+
+        step_nll = F.cross_entropy(
+            step_logits.squeeze(1),
+            step_targets,
+            ignore_index=-100,
+            reduction="sum",
+        )
+
+        step_loss = step_nll / total_valid_tokens.to(step_nll.dtype)
+        total_loss_value = total_loss_value + step_loss.detach()
+
+        # In MC-only freeze stage, early tokens can legitimately have no grad path
+        # (before the first segment is cached). Backprop only when a graph exists.
+        if step_loss.requires_grad:
+            (step_loss / grad_accum_steps).backward()
+            any_grad_step = True
+
+    if not any_grad_step:
+        raise RuntimeError(
+            "Loss has no grad_fn for all tokens in this batch. In freeze stage, this usually means "
+            "trainable MC params did not influence logits. Try setting --mc-segment-size smaller than "
+            "--block-size (for example, --mc-segment-size 64 with --block-size 256), or unfreeze more params."
+        )
+
+    return total_loss_value
+
+
 def train_one_epoch(
     model,
     tokenizer,
@@ -428,8 +597,10 @@ def train_one_epoch(
     warmup_steps = int(updates_this_epoch * args.warmup_ratio)
     scheduler = build_linear_warmup_scheduler(optimizer, warmup_steps, updates_this_epoch)
 
-    running_loss = 0.0
+    running_loss = torch.zeros((), device=device)
     next_val_checkpoint = 1000
+    mc_only_memory_mode = _is_mc_only_trainable(model) and args.mc_train_mode == "memory"
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
 
     print(
         f"Training 1 epoch | stage={stage_tag} dataset={dataset_tag}: batches={num_batches}, "
@@ -444,30 +615,34 @@ def train_one_epoch(
     )
 
     for step, batch in progress:
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["labels"].to(device)
+        input_ids = batch["input_ids"].to(device, non_blocking=(device.type == "cuda"))
+        labels = batch["labels"].to(device, non_blocking=(device.type == "cuda"))
         batch_data_points = int(input_ids.size(0))
         data_points_seen += batch_data_points
 
-        logits, _ = model(input_ids)
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-
-        loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=-100,
-        )
-        loss = loss / args.grad_accum_steps
-        loss.backward()
-        running_loss += loss.item() * args.grad_accum_steps
+        if mc_only_memory_mode:
+            loss_value = backward_batch_loss_mc_streaming(
+                model=model,
+                input_ids=input_ids,
+                labels=labels,
+                grad_accum_steps=args.grad_accum_steps,
+            )
+            running_loss = running_loss + loss_value
+        else:
+            loss = compute_batch_loss(model, input_ids, labels)
+            if not loss.requires_grad:
+                raise RuntimeError(
+                    "Loss has no grad_fn. In freeze stage, this usually means trainable MC params "
+                    "did not influence logits. Try setting --mc-segment-size smaller than --block-size "
+                    "(for example, --mc-segment-size 64 with --block-size 256), or unfreeze more params."
+                )
+            loss = loss / args.grad_accum_steps
+            loss.backward()
+            running_loss = running_loss + (loss.detach() * args.grad_accum_steps)
 
         should_update = (step % args.grad_accum_steps == 0) or (step == num_batches)
         if should_update:
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad],
-                args.max_grad_norm,
-            )
+            torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
@@ -475,7 +650,7 @@ def train_one_epoch(
             global_step += 1
 
             if global_step % args.log_every == 0:
-                avg_loss = running_loss / args.log_every
+                avg_loss = float((running_loss / args.log_every).item())
                 ppl = math.exp(min(avg_loss, 20))
                 lr = scheduler.get_last_lr()[0]
                 log_msg = (
@@ -484,7 +659,7 @@ def train_one_epoch(
                 )
                 print(log_msg)
                 progress.set_postfix_str(f"loss={avg_loss:.4f}")
-                running_loss = 0.0
+                running_loss = torch.zeros((), device=device)
 
         if args.data_point_checkpoint_interval > 0:
             while data_points_seen >= next_data_point_checkpoint:
@@ -582,18 +757,10 @@ def evaluate(model, val_loader, device, args) -> float:
 
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Evaluating", leave=False):
-            input_ids = batch["input_ids"].to(device)
-            labels = batch["labels"].to(device)
+            input_ids = batch["input_ids"].to(device, non_blocking=(device.type == "cuda"))
+            labels = batch["labels"].to(device, non_blocking=(device.type == "cuda"))
 
-            logits, _ = model(input_ids)
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+            loss = compute_batch_loss(model, input_ids, labels)
             total_loss += loss.item()
             num_batches += 1
 
@@ -682,9 +849,25 @@ def main() -> None:
 
     if args.block_size % 64 != 0:
         raise ValueError("--block-size should be a multiple of 64 to match Mamba2 chunking.")
+    if args.mc_segment_size <= 0:
+        raise ValueError("--mc-segment-size must be > 0.")
+    if args.mc_segment_size > args.block_size:
+        raise ValueError("--mc-segment-size should be <= --block-size.")
+    if args.mc_max_cached_segments < 0:
+        raise ValueError("--mc-max-cached-segments must be >= 0.")
+    if args.dataloader_num_workers < 0:
+        raise ValueError("--dataloader-num-workers must be >= 0.")
+    if args.dataloader_prefetch_factor <= 0:
+        raise ValueError("--dataloader-prefetch-factor must be > 0.")
 
     torch.manual_seed(args.seed)
     device = get_device()
+
+    if device.type == "cuda":
+        # Throughput-oriented CUDA defaults.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
 
     os.makedirs(args.output_dir, exist_ok=True)
     print(f"Using device: {device}")
@@ -695,7 +878,14 @@ def main() -> None:
         model = load_mamba2_model(args.model_id, device=device, cache_dir=args.cache_dir)
     elif args.model_type == 'Mamba2MC':
         print("Loading Ours")
-        model = load_our_model(args.model_id, device=device, cache_dir=args.cache_dir)
+        model = load_our_model(
+            args.model_id,
+            device=device,
+            cache_dir=args.cache_dir,
+            segment_size=args.mc_segment_size,
+            max_cached_segments=args.mc_max_cached_segments,
+            detach_cached_segments=(not args.mc_backprop_history),
+        )
     else:
         raise ValueError(f"Unsupported model type: {args.model_type}")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_id, cache_dir=args.cache_dir)
