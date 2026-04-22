@@ -88,13 +88,6 @@ def parse_args() -> argparse.Namespace:
         help="Backpropagate through historical cached segments. Disabled by default for better speed and memory.",
     )
     parser.add_argument(
-        "--mc-train-mode",
-        type=str,
-        choices=["throughput", "memory"],
-        default="throughput",
-        help="throughput: one backward per batch (faster, more memory). memory: token-streaming backward (slower, lower memory).",
-    )
-    parser.add_argument(
         "--dataloader-num-workers",
         type=int,
         default=4,
@@ -360,11 +353,11 @@ def normalize_dataset_choice(train_datasets: list[str]) -> list[str]:
 
 
 def _is_mc_specific_trainable_param(name: str) -> bool:
-    """Return True for MC-only params intended to train during freeze stage."""
+    """Return True for Mamba2MC-only params intended for freeze-stage training."""
     return (
         name == "W"
         or name.endswith(".W")
-        or "W_u" in name
+        or "mc_weight_matrix" in name
         or "online_bias" in name
     )
 
@@ -487,90 +480,15 @@ def _is_mc_only_trainable(model) -> bool:
 
 
 def compute_batch_loss(model, input_ids, labels) -> torch.Tensor:
-    """Compute autoregressive CE loss; uses streamed-token path for Mamba2MC to save memory."""
-    if not _is_mc_model(model):
-        logits, _ = model(input_ids)
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-        return F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=-100,
-        )
-
-    batch_size, seqlen = input_ids.shape
-    if seqlen < 2:
-        raise ValueError("Input sequence length must be at least 2 for autoregressive loss.")
-
-    caches = model.alloc_cache(batch_size=batch_size)
-    total_nll = torch.zeros((), device=input_ids.device)
-    total_valid_tokens = (labels[:, 1:] != -100).sum()
-    if int(total_valid_tokens.item()) == 0:
-        raise RuntimeError("No valid tokens available to compute loss.")
-
-    for pos in range(seqlen - 1):
-        step_logits, caches = model.step(input_ids[:, pos : pos + 1], caches)
-        step_targets = labels[:, pos + 1]
-
-        step_nll = F.cross_entropy(
-            step_logits.squeeze(1),
-            step_targets,
-            ignore_index=-100,
-            reduction="sum",
-        )
-
-        total_nll = total_nll + step_nll
-
-    return total_nll / total_valid_tokens.to(total_nll.dtype)
-
-
-def backward_batch_loss_mc_streaming(
-    model,
-    input_ids,
-    labels,
-    grad_accum_steps: int,
-) -> torch.Tensor:
-    """Memory-efficient MC freeze-stage loss/backward: backprop each token immediately."""
-    batch_size, seqlen = input_ids.shape
-    if seqlen < 2:
-        raise ValueError("Input sequence length must be at least 2 for autoregressive loss.")
-
-    caches = model.alloc_cache(batch_size=batch_size)
-    total_valid_tokens = (labels[:, 1:] != -100).sum()
-    if int(total_valid_tokens.item()) == 0:
-        raise RuntimeError("No valid tokens available to compute loss.")
-
-    total_loss_value = torch.zeros((), device=input_ids.device)
-    any_grad_step = False
-
-    for pos in range(seqlen - 1):
-        step_logits, caches = model.step(input_ids[:, pos : pos + 1], caches)
-        step_targets = labels[:, pos + 1]
-
-        step_nll = F.cross_entropy(
-            step_logits.squeeze(1),
-            step_targets,
-            ignore_index=-100,
-            reduction="sum",
-        )
-
-        step_loss = step_nll / total_valid_tokens.to(step_nll.dtype)
-        total_loss_value = total_loss_value + step_loss.detach()
-
-        # In MC-only freeze stage, early tokens can legitimately have no grad path
-        # (before the first segment is cached). Backprop only when a graph exists.
-        if step_loss.requires_grad:
-            (step_loss / grad_accum_steps).backward()
-            any_grad_step = True
-
-    if not any_grad_step:
-        raise RuntimeError(
-            "Loss has no grad_fn for all tokens in this batch. In freeze stage, this usually means "
-            "trainable MC params did not influence logits. Try setting --mc-segment-size smaller than "
-            "--block-size (for example, --mc-segment-size 64 with --block-size 256), or unfreeze more params."
-        )
-
-    return total_loss_value
+    """Compute autoregressive CE loss from full-sequence logits for all model types."""
+    logits, _ = model(input_ids)
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    return F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+        ignore_index=-100,
+    )
 
 
 def train_one_epoch(
@@ -599,7 +517,6 @@ def train_one_epoch(
 
     running_loss = torch.zeros((), device=device)
     next_val_checkpoint = 1000
-    mc_only_memory_mode = _is_mc_only_trainable(model) and args.mc_train_mode == "memory"
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
     print(
@@ -620,25 +537,16 @@ def train_one_epoch(
         batch_data_points = int(input_ids.size(0))
         data_points_seen += batch_data_points
 
-        if mc_only_memory_mode:
-            loss_value = backward_batch_loss_mc_streaming(
-                model=model,
-                input_ids=input_ids,
-                labels=labels,
-                grad_accum_steps=args.grad_accum_steps,
+        loss = compute_batch_loss(model, input_ids, labels)
+        if not loss.requires_grad:
+            raise RuntimeError(
+                "Loss has no grad_fn. In freeze stage, this usually means trainable MC params "
+                "did not influence logits. Try setting --mc-segment-size smaller than --block-size "
+                "(for example, --mc-segment-size 64 with --block-size 256), or unfreeze more params."
             )
-            running_loss = running_loss + loss_value
-        else:
-            loss = compute_batch_loss(model, input_ids, labels)
-            if not loss.requires_grad:
-                raise RuntimeError(
-                    "Loss has no grad_fn. In freeze stage, this usually means trainable MC params "
-                    "did not influence logits. Try setting --mc-segment-size smaller than --block-size "
-                    "(for example, --mc-segment-size 64 with --block-size 256), or unfreeze more params."
-                )
-            loss = loss / args.grad_accum_steps
-            loss.backward()
-            running_loss = running_loss + (loss.detach() * args.grad_accum_steps)
+        loss = loss / args.grad_accum_steps
+        loss.backward()
+        running_loss = running_loss + (loss.detach() * args.grad_accum_steps)
 
         should_update = (step % args.grad_accum_steps == 0) or (step == num_batches)
         if should_update:
