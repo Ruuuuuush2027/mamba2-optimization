@@ -71,6 +71,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=2e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.01)
+    parser.add_argument(
+        "--lr-scheduler",
+        type=str,
+        default="cosine",
+        choices=["cosine", "linear", "constant"],
+        help="LR schedule after warmup.",
+    )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--block-size", type=int, default=128, help="Should be a multiple of 64 for this model.")
     parser.add_argument(
@@ -89,6 +96,12 @@ def parse_args() -> argparse.Namespace:
         "--mc-backprop-history",
         action="store_true",
         help="Backpropagate through historical cached segments. Disabled by default for better speed and memory.",
+    )
+    parser.add_argument(
+        "--mc-online-bias-init",
+        type=float,
+        default=1.0,
+        help="Initialization value for Mamba2MC online_bias (recommended 0-2).",
     )
     parser.add_argument(
         "--dataloader-num-workers",
@@ -164,9 +177,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def tokenize_and_pack_text_dataset(text_dataset: Dataset, tokenizer, block_size: int) -> Dataset:
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None:
+        raise ValueError("Tokenizer must have eos_token_id for document boundary packing.")
+
     def tokenize_fn(examples):
         texts = [t for t in examples["text"] if t and not t.isspace()]
-        return tokenizer(texts, return_attention_mask=False)
+        tokenized = tokenizer(texts, return_attention_mask=False)
+        input_ids = []
+        for seq in tokenized["input_ids"]:
+            # Insert EOS between docs to preserve boundaries during packing.
+            input_ids.append(seq + [eos_token_id])
+        return {"input_ids": input_ids}
 
     def group_texts(examples):
         concatenated = []
@@ -594,20 +616,51 @@ def unfreeze_all_params(model) -> None:
 
 
 def build_optimizer(model, args) -> AdamW:
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    if not trainable_params:
+    named_trainable_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    if not named_trainable_params:
         raise ValueError("No trainable parameters found for optimizer.")
-    return AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
+    no_decay_params = []
+    decay_params = []
+    for name, param in named_trainable_params:
+        lname = name.lower()
+        if (
+            lname.endswith("bias")
+            or "norm" in lname
+            or "embedding" in lname
+            or lname.endswith("online_bias")
+        ):
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    param_groups = []
+    if decay_params:
+        param_groups.append({"params": decay_params, "weight_decay": args.weight_decay})
+    if no_decay_params:
+        param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+    return AdamW(param_groups, lr=args.learning_rate)
 
 
-def build_warmup_scheduler(optimizer, warmup_steps: int) -> LambdaLR:
-    if warmup_steps <= 0:
+def build_warmup_decay_scheduler(
+    optimizer, warmup_steps: int, total_steps: int, scheduler_name: str
+) -> LambdaLR:
+    if total_steps <= 0:
         return LambdaLR(optimizer, lr_lambda=lambda _step: 1.0)
+    warmup_steps = max(0, min(warmup_steps, total_steps))
 
     def lr_lambda(step: int) -> float:
-        if step >= warmup_steps:
+        current_step = step + 1
+        if warmup_steps > 0 and current_step <= warmup_steps:
+            return float(current_step) / float(warmup_steps)
+        if scheduler_name == "constant":
             return 1.0
-        return float(step + 1) / float(warmup_steps)
+        decay_steps = max(1, total_steps - warmup_steps)
+        progress = min(1.0, max(0.0, float(current_step - warmup_steps) / float(decay_steps)))
+        if scheduler_name == "linear":
+            return max(0.0, 1.0 - progress)
+        if scheduler_name == "cosine":
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+        return 1.0
 
     return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
@@ -627,8 +680,9 @@ def save_data_point_checkpoint(
     data_points_mark: int,
     stage_tag: str,
     epoch_idx: int,
+    model_type: str,
 ) -> None:
-    ckpt_dir = Path(checkpoint_dir) / f"data-points-{data_points_mark}"
+    ckpt_dir = Path(checkpoint_dir) / f"{model_type}-data-points-{data_points_mark}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), ckpt_dir / "pytorch_model.bin")
     tokenizer.save_pretrained(ckpt_dir)
@@ -681,6 +735,8 @@ def train_one_epoch(
     stage_epochs: int,
     scheduler=None,
     val_loader=None,
+    val_dataset_tag: str | None = None,
+    val_loaders: list[tuple[str, DataLoader]] | None = None,
 ) -> tuple[int, int, int]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -694,7 +750,13 @@ def train_one_epoch(
         next_train_log_checkpoint = (
             (data_points_seen // args.log_every_data_points) + 1
         ) * args.log_every_data_points
-    next_val_checkpoint = 1000
+    val_interval = args.data_point_checkpoint_interval if args.data_point_checkpoint_interval > 0 else args.log_every_data_points
+    has_validation = (val_loader is not None) or (val_loaders is not None and len(val_loaders) > 0)
+    next_val_checkpoint = (
+        ((data_points_seen // val_interval) + 1) * val_interval
+        if (has_validation and val_interval > 0)
+        else None
+    )
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
     print(
@@ -769,18 +831,24 @@ def train_one_epoch(
                     data_points_mark=next_data_point_checkpoint,
                     stage_tag=stage_tag,
                     epoch_idx=epoch_idx,
+                    model_type=args.model_type,
                 )
                 next_data_point_checkpoint += args.data_point_checkpoint_interval
 
-        # Validation every 1k datapoints
-        if val_loader is not None and data_points_seen >= next_val_checkpoint:
-            val_loss = evaluate(model, val_loader, device, args)
-            val_ppl = perplexity_from_loss(val_loss)
-            print(
-                f"Validation | data_points={data_points_seen} "
-                f"loss={val_loss:.4f} ppl={val_ppl:.3e}"
-            )
-            next_val_checkpoint += 1000
+        # Run validation each checkpoint/interval.
+        if has_validation and next_val_checkpoint is not None and data_points_seen >= next_val_checkpoint:
+            active_val_loaders = val_loaders
+            if active_val_loaders is None and val_loader is not None:
+                active_val_loaders = [(val_dataset_tag or dataset_tag, val_loader)]
+            for eval_name, eval_loader in (active_val_loaders or []):
+                val_loss = evaluate(model, eval_loader, device, args)
+                val_ppl = perplexity_from_loss(val_loss)
+                print(
+                    f"Validation | dataset={eval_name} data_points={data_points_seen} "
+                    f"loss={val_loss:.4f} ppl={val_ppl:.3e}"
+                )
+            while data_points_seen >= next_val_checkpoint:
+                next_val_checkpoint += val_interval
             model.train()
 
     return global_step, data_points_seen, next_data_point_checkpoint
@@ -873,7 +941,7 @@ def evaluate(model, val_loader, device, args) -> float:
 
 
 def save_stage_checkpoint(model, tokenizer, args, stage_tag: str, epoch_idx: int, dataset_name: str) -> None:
-    ckpt_dir = Path(args.output_dir) / f"{stage_tag}-epoch-{epoch_idx}-{dataset_name}"
+    ckpt_dir = Path(args.output_dir) / f"{args.model_type}-{stage_tag}-epoch-{epoch_idx}-{dataset_name}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), ckpt_dir / "pytorch_model.bin")
     tokenizer.save_pretrained(ckpt_dir)
@@ -894,14 +962,30 @@ def run_stage(
     next_data_point_checkpoint: int,
 ) -> tuple[int, int, int]:
     scheduler = None
+    total_updates = _estimate_stage_total_updates(args, tokenizer, selected_datasets, stage_epochs)
+    warmup_steps = int(total_updates * args.warmup_ratio)
+    if total_updates > 0:
+        scheduler = build_warmup_decay_scheduler(
+            optimizer=optimizer,
+            warmup_steps=warmup_steps,
+            total_steps=total_updates,
+            scheduler_name=args.lr_scheduler,
+        )
+        print(
+            f"Scheduler configured: type={args.lr_scheduler} total_updates={total_updates} "
+            f"warmup_steps={warmup_steps}"
+        )
     for epoch_idx in range(1, stage_epochs + 1):
         print(f"=== {stage_tag} epoch {epoch_idx}/{stage_epochs} ===")
         if args.dataset_strategy == "mix":
             mixed_loader = get_mixed_loader(args, tokenizer, selected_datasets)
-            if scheduler is None:
-                updates_this_epoch = max(1, math.ceil(len(mixed_loader) / args.grad_accum_steps))
-                warmup_steps = int(updates_this_epoch * args.warmup_ratio)
-                scheduler = build_warmup_scheduler(optimizer, warmup_steps)
+            val_loaders = _build_stage_val_loaders(args, tokenizer, selected_datasets)
+            for val_name, val_loader in val_loaders:
+                val_loss = evaluate(model, val_loader, device, args)
+                print(
+                    f"Validation | dataset={val_name} data_points={data_points_seen} "
+                    f"loss={val_loss:.4f} ppl={perplexity_from_loss(val_loss):.3e}"
+                )
             global_step, data_points_seen, next_data_point_checkpoint = train_one_epoch(
                 model,
                 tokenizer,
@@ -917,6 +1001,7 @@ def run_stage(
                 epoch_idx=epoch_idx,
                 stage_epochs=stage_epochs,
                 scheduler=scheduler,
+                val_loaders=val_loaders,
             )
             save_stage_checkpoint(model, tokenizer, args, stage_tag, epoch_idx, "mixed")
         else:
@@ -930,10 +1015,12 @@ def run_stage(
                 else:
                     continue
 
-                if scheduler is None:
-                    updates_this_epoch = max(1, math.ceil(len(loader) / args.grad_accum_steps))
-                    warmup_steps = int(updates_this_epoch * args.warmup_ratio)
-                    scheduler = build_warmup_scheduler(optimizer, warmup_steps)
+                val_loader = _build_val_loader_for_dataset(args, tokenizer, dataset_name)
+                val_loss = evaluate(model, val_loader, device, args)
+                print(
+                    f"Validation | dataset={dataset_name} data_points={data_points_seen} "
+                    f"loss={val_loss:.4f} ppl={perplexity_from_loss(val_loss):.3e}"
+                )
 
                 global_step, data_points_seen, next_data_point_checkpoint = train_one_epoch(
                     model=model,
@@ -950,9 +1037,46 @@ def run_stage(
                     epoch_idx=epoch_idx,
                     stage_epochs=stage_epochs,
                     scheduler=scheduler,
+                    val_loader=val_loader,
+                    val_dataset_tag=dataset_name,
                 )
                 save_stage_checkpoint(model, tokenizer, args, stage_tag, epoch_idx, dataset_name)
     return global_step, data_points_seen, next_data_point_checkpoint
+
+
+def _build_val_loader_for_dataset(args, tokenizer, dataset_name: str) -> DataLoader:
+    if dataset_name == "wikitext":
+        return get_wikitext_val_loader(args, tokenizer)
+    if dataset_name == "fineweb":
+        return get_fineweb_val_loader(args, tokenizer)
+    raise ValueError(f"Unsupported dataset for validation: {dataset_name}")
+
+
+def _build_stage_val_loaders(args, tokenizer, selected_datasets: list[str]) -> list[tuple[str, DataLoader]]:
+    loaders = []
+    for dataset_name in selected_datasets:
+        loaders.append((dataset_name, _build_val_loader_for_dataset(args, tokenizer, dataset_name)))
+    return loaders
+
+
+def _estimate_stage_total_updates(args, tokenizer, selected_datasets: list[str], stage_epochs: int) -> int:
+    if stage_epochs <= 0:
+        return 0
+    if args.dataset_strategy == "mix":
+        loader = get_mixed_loader(args, tokenizer, selected_datasets)
+        updates_per_epoch = max(1, math.ceil(len(loader) / args.grad_accum_steps))
+        return updates_per_epoch * stage_epochs
+
+    total_updates = 0
+    for dataset_name in selected_datasets:
+        if dataset_name == "wikitext":
+            loader = get_wikitext_loader(args, tokenizer)
+        elif dataset_name == "fineweb":
+            loader = get_fineweb_loader(args, tokenizer)
+        else:
+            continue
+        total_updates += max(1, math.ceil(len(loader) / args.grad_accum_steps))
+    return total_updates * stage_epochs
 
 
 def main() -> None:
@@ -980,6 +1104,10 @@ def main() -> None:
         raise ValueError("--wikitext-target-tokens must be >= 0.")
     if args.fineweb_target_tokens <= 0:
         raise ValueError("--fineweb-target-tokens must be > 0.")
+    if args.model_type == "Mamba2MC" and not (0.0 <= args.mc_online_bias_init <= 2.0):
+        print(
+            f"Warning: --mc-online-bias-init={args.mc_online_bias_init} is outside the recommended 0-2 range."
+        )
 
     torch.manual_seed(args.seed)
     device = get_device()
@@ -992,6 +1120,10 @@ def main() -> None:
 
     os.makedirs(args.output_dir, exist_ok=True)
     print(f"Using device: {device}")
+    print(
+        "Tip: if train PPL stalls above your target, increase token budget/context "
+        "(--fineweb-target-tokens, --wikitext-target-tokens, --block-size)."
+    )
 
     print("Loading model and tokenizer...")
     if args.model_type == 'Mamba2':
@@ -1007,6 +1139,10 @@ def main() -> None:
             max_cached_segments=args.mc_max_cached_segments,
             detach_cached_segments=(not args.mc_backprop_history),
         )
+        if hasattr(model, "online_bias"):
+            with torch.no_grad():
+                model.online_bias.fill_(args.mc_online_bias_init)
+            print(f"Initialized online_bias to {args.mc_online_bias_init:.4f}")
     else:
         raise ValueError(f"Unsupported model type: {args.model_type}")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_id, cache_dir=args.cache_dir)
@@ -1024,6 +1160,11 @@ def main() -> None:
         print(f"Freeze stage model policy applied: {policy_model_name}")
         print(f"Freeze stage trainable params count: {len(trainable_names)}")
         print(f"Freeze stage frozen params count: {len(frozen_names)}")
+        if args.model_type == "Mamba2MC" and len(trainable_names) <= 2:
+            raise ValueError(
+                "Mamba2MC freeze stage has <=2 trainable params. Set --freeze-epochs 0 "
+                "or expand trainable params for freeze stage."
+            )
         optimizer = build_optimizer(model, args)
         global_step, data_points_seen, next_data_point_checkpoint = run_stage(
             model=model,
@@ -1057,7 +1198,7 @@ def main() -> None:
             next_data_point_checkpoint=next_data_point_checkpoint,
         )
 
-    final_dir = Path(args.output_dir) / "final"
+    final_dir = Path(args.output_dir) / f"{args.model_type}-final"
     final_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), final_dir / "pytorch_model.bin")
     tokenizer.save_pretrained(final_dir)

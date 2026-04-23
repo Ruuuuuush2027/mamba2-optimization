@@ -4,3 +4,4 @@ __pycache__/
 huggingface_cache/
 checkpoints/
 *.job
+*.out
