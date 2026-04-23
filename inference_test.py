@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint-dir",
         type=str,
-        default="./mamba2-optimization/checkpoints/mamba2-finetune/final",
+        default="./checkpoints/mamba2-finetune/Mamba2-final",
         help="Directory containing pytorch_model.bin from fine-tuning.",
     )
     parser.add_argument("--prompt", type=str, default="Mamba is")

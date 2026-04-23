@@ -104,6 +104,17 @@ def parse_args() -> argparse.Namespace:
         help="Initialization value for Mamba2MC online_bias (recommended 0-2).",
     )
     parser.add_argument(
+        "--mc-freeze-train-mode",
+        type=str,
+        default="mc_plus_norm",
+        choices=["mc_only", "mc_plus_norm", "all"],
+        help=(
+            "Which params to train during Mamba2MC freeze stage: "
+            "mc_only trains only MC params; mc_plus_norm also trains norm params; "
+            "all trains all params."
+        ),
+    )
+    parser.add_argument(
         "--dataloader-num-workers",
         type=int,
         default=4,
@@ -121,6 +132,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=200,
         help="Print training loss/ppl every N processed data points.",
+    )
+    parser.add_argument(
+        "--run-initial-validation",
+        action="store_true",
+        help="Run validation before training updates in each stage/epoch.",
+    )
+    parser.add_argument(
+        "--val-fraction-of-train",
+        type=float,
+        default=0.10,
+        help="Validation subset size as a fraction of train token target.",
     )
 
     parser.add_argument(
@@ -479,13 +501,27 @@ def get_fineweb_text_dataset(args) -> Dataset:
 
 def get_wikitext_val_loader(args, tokenizer) -> DataLoader:
     dataset = load_dataset("Salesforce/wikitext", args.wikitext_config, split="validation", cache_dir=args.cache_dir)
+    if args.wikitext_target_tokens > 0:
+        val_target_tokens = max(1, int(args.wikitext_target_tokens * args.val_fraction_of_train))
+        texts, total_tokens = _collect_texts_by_token_target(
+            dataset,
+            tokenizer=tokenizer,
+            target_tokens=val_target_tokens,
+            source_name="wikitext-val",
+        )
+        if not texts:
+            raise RuntimeError("No WikiText validation text was collected.")
+        print(
+            f"Collected WikiText validation slice: docs={len(texts)}, tokens={total_tokens} "
+            f"(target~{val_target_tokens})"
+        )
+        dataset = Dataset.from_dict({"text": texts})
     packed = tokenize_and_pack_text_dataset(dataset, tokenizer, args.block_size)
     return build_dataloader(packed, args, shuffle=False)
 
 
 def get_fineweb_val_loader(args, tokenizer) -> DataLoader:
-    # For fineweb validation, use a small fixed subset
-    target_bytes = 50 * 1024 * 1024  # 50MB for validation
+    val_target_tokens = max(1, int(args.fineweb_target_tokens * args.val_fraction_of_train))
     streamed = load_dataset(
         "HuggingFaceFW/fineweb",
         name=args.fineweb_config,
@@ -494,20 +530,18 @@ def get_fineweb_val_loader(args, tokenizer) -> DataLoader:
         cache_dir=args.cache_dir,
     )
 
-    texts = []
-    total_bytes = 0
-    for i, sample in enumerate(streamed):
-        text = sample.get("text", "")
-        if not text or text.isspace():
-            continue
-        text_bytes = len(text.encode("utf-8"))
-        if total_bytes + text_bytes > target_bytes:
-            break
-        texts.append(text)
-        total_bytes += text_bytes
-
+    texts, total_tokens = _collect_texts_by_token_target(
+        streamed,
+        tokenizer=tokenizer,
+        target_tokens=val_target_tokens,
+        source_name="fineweb-val",
+    )
     if not texts:
         raise RuntimeError("No FineWeb validation text was collected.")
+    print(
+        f"Collected FineWeb validation slice: docs={len(texts)}, tokens={total_tokens} "
+        f"(target~{val_target_tokens})"
+    )
 
     text_dataset = Dataset.from_dict({"text": texts})
     packed = tokenize_and_pack_text_dataset(text_dataset, tokenizer, args.block_size)
@@ -555,7 +589,11 @@ def _is_mc_specific_trainable_param(name: str) -> bool:
     )
 
 
-def configure_stage1_trainability_by_model_name(model) -> tuple[str, list[str], list[str]]:
+def _is_norm_param(name: str) -> bool:
+    return "norm" in name.lower()
+
+
+def configure_stage1_trainability_by_model_name(model, args) -> tuple[str, list[str], list[str]]:
     model_name = model.__class__.__name__
 
     if model_name == "Mamba2LMHeadModel":
@@ -563,10 +601,16 @@ def configure_stage1_trainability_by_model_name(model) -> tuple[str, list[str], 
         for _, param in model.named_parameters():
             param.requires_grad = True
     elif model_name == "Mamba2MCLMHeadModel":
-        # Freeze original model parameters, train only MC-specific params.
-        # Supports both legacy MC param names and current state-only MC `W`.
+        # Freeze-stage policy for MC model is configurable.
         for name, param in model.named_parameters():
-            param.requires_grad = _is_mc_specific_trainable_param(name)
+            if args.mc_freeze_train_mode == "mc_only":
+                param.requires_grad = _is_mc_specific_trainable_param(name)
+            elif args.mc_freeze_train_mode == "mc_plus_norm":
+                param.requires_grad = _is_mc_specific_trainable_param(name) or _is_norm_param(name)
+            elif args.mc_freeze_train_mode == "all":
+                param.requires_grad = True
+            else:
+                param.requires_grad = _is_mc_specific_trainable_param(name)
     else:
         # pass for all other model names: leave requires_grad unchanged.
         pass
@@ -980,12 +1024,13 @@ def run_stage(
         if args.dataset_strategy == "mix":
             mixed_loader = get_mixed_loader(args, tokenizer, selected_datasets)
             val_loaders = _build_stage_val_loaders(args, tokenizer, selected_datasets)
-            for val_name, val_loader in val_loaders:
-                val_loss = evaluate(model, val_loader, device, args)
-                print(
-                    f"Validation | dataset={val_name} data_points={data_points_seen} "
-                    f"loss={val_loss:.4f} ppl={perplexity_from_loss(val_loss):.3e}"
-                )
+            if args.run_initial_validation:
+                for val_name, val_loader in val_loaders:
+                    val_loss = evaluate(model, val_loader, device, args)
+                    print(
+                        f"Validation | dataset={val_name} data_points={data_points_seen} "
+                        f"loss={val_loss:.4f} ppl={perplexity_from_loss(val_loss):.3e}"
+                    )
             global_step, data_points_seen, next_data_point_checkpoint = train_one_epoch(
                 model,
                 tokenizer,
@@ -1016,11 +1061,12 @@ def run_stage(
                     continue
 
                 val_loader = _build_val_loader_for_dataset(args, tokenizer, dataset_name)
-                val_loss = evaluate(model, val_loader, device, args)
-                print(
-                    f"Validation | dataset={dataset_name} data_points={data_points_seen} "
-                    f"loss={val_loss:.4f} ppl={perplexity_from_loss(val_loss):.3e}"
-                )
+                if args.run_initial_validation:
+                    val_loss = evaluate(model, val_loader, device, args)
+                    print(
+                        f"Validation | dataset={dataset_name} data_points={data_points_seen} "
+                        f"loss={val_loss:.4f} ppl={perplexity_from_loss(val_loss):.3e}"
+                    )
 
                 global_step, data_points_seen, next_data_point_checkpoint = train_one_epoch(
                     model=model,
@@ -1104,6 +1150,8 @@ def main() -> None:
         raise ValueError("--wikitext-target-tokens must be >= 0.")
     if args.fineweb_target_tokens <= 0:
         raise ValueError("--fineweb-target-tokens must be > 0.")
+    if not (0.0 < args.val_fraction_of_train <= 1.0):
+        raise ValueError("--val-fraction-of-train must be in (0, 1].")
     if args.model_type == "Mamba2MC" and not (0.0 <= args.mc_online_bias_init <= 2.0):
         print(
             f"Warning: --mc-online-bias-init={args.mc_online_bias_init} is outside the recommended 0-2 range."
@@ -1156,14 +1204,14 @@ def main() -> None:
     next_data_point_checkpoint = args.data_point_checkpoint_interval
 
     if args.freeze_epochs > 0:
-        policy_model_name, trainable_names, frozen_names = configure_stage1_trainability_by_model_name(model)
+        policy_model_name, trainable_names, frozen_names = configure_stage1_trainability_by_model_name(model, args)
         print(f"Freeze stage model policy applied: {policy_model_name}")
         print(f"Freeze stage trainable params count: {len(trainable_names)}")
         print(f"Freeze stage frozen params count: {len(frozen_names)}")
         if args.model_type == "Mamba2MC" and len(trainable_names) <= 2:
             raise ValueError(
-                "Mamba2MC freeze stage has <=2 trainable params. Set --freeze-epochs 0 "
-                "or expand trainable params for freeze stage."
+                "Mamba2MC freeze stage has <=2 trainable params under current --mc-freeze-train-mode. "
+                "Use --mc-freeze-train-mode mc_plus_norm (recommended), all, or set --freeze-epochs 0."
             )
         optimizer = build_optimizer(model, args)
         global_step, data_points_seen, next_data_point_checkpoint = run_stage(
