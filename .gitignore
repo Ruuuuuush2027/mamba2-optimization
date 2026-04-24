@@ -5,3 +5,4 @@ huggingface_cache/
 checkpoints/
 *.job
 *.out
+*.zip
