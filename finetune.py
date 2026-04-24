@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from pathlib import Path
 
 import torch
@@ -194,6 +195,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10000,
         help="Save a checkpoint every N processed data points.",
+    )
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        type=str,
+        default="",
+        help="Path to a checkpoint directory containing pytorch_model.bin (and optional meta.txt/tokenizer files).",
     )
     return parser.parse_args()
 
@@ -725,6 +732,7 @@ def save_data_point_checkpoint(
     stage_tag: str,
     epoch_idx: int,
     model_type: str,
+    global_step: int,
 ) -> None:
     ckpt_dir = Path(checkpoint_dir) / f"{model_type}-data-points-{data_points_mark}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -732,10 +740,60 @@ def save_data_point_checkpoint(
     tokenizer.save_pretrained(ckpt_dir)
     meta_path = ckpt_dir / "meta.txt"
     meta_path.write_text(
-        f"stage={stage_tag}\nepoch={epoch_idx}\ndata_points={data_points_mark}\n",
+        f"stage={stage_tag}\nepoch={epoch_idx}\ndata_points={data_points_mark}\nglobal_step={global_step}\n",
         encoding="utf-8",
     )
     print(f"Saved data-point checkpoint to {ckpt_dir}")
+
+
+def _read_checkpoint_meta(ckpt_dir: Path) -> dict[str, str]:
+    meta_path = ckpt_dir / "meta.txt"
+    if not meta_path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in meta_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
+
+
+def _parse_checkpoint_stage_epoch_from_dirname(ckpt_dir: Path) -> tuple[str | None, int | None]:
+    name = ckpt_dir.name
+    match = re.search(r"-(freeze|full)-epoch-(\d+)-", name)
+    if not match:
+        return None, None
+    stage = match.group(1)
+    try:
+        epoch = int(match.group(2))
+    except ValueError:
+        return stage, None
+    return stage, epoch
+
+
+def _resolve_resume_stage_epoch(ckpt_dir: Path, ckpt_meta: dict[str, str]) -> tuple[str | None, int]:
+    resume_stage = ckpt_meta.get("stage")
+    resume_epoch = 0
+
+    if "epoch" in ckpt_meta:
+        try:
+            resume_epoch = int(ckpt_meta["epoch"])
+        except ValueError:
+            print(f"Warning: invalid epoch in checkpoint meta: {ckpt_meta['epoch']}")
+
+    if resume_stage is None:
+        parsed_stage, parsed_epoch = _parse_checkpoint_stage_epoch_from_dirname(ckpt_dir)
+        resume_stage = parsed_stage
+        if parsed_epoch is not None:
+            resume_epoch = parsed_epoch
+
+    return resume_stage, resume_epoch
+
+
+def _checkpoint_is_data_point_ckpt(ckpt_dir: Path) -> bool:
+    return "-data-points-" in ckpt_dir.name
 
 
 def _is_mc_model(model) -> bool:
@@ -876,6 +934,7 @@ def train_one_epoch(
                     stage_tag=stage_tag,
                     epoch_idx=epoch_idx,
                     model_type=args.model_type,
+                    global_step=global_step,
                 )
                 next_data_point_checkpoint += args.data_point_checkpoint_interval
 
@@ -1001,12 +1060,21 @@ def run_stage(
     selected_datasets: list[str],
     stage_tag: str,
     stage_epochs: int,
+    start_epoch_idx: int,
     global_step: int,
     data_points_seen: int,
     next_data_point_checkpoint: int,
 ) -> tuple[int, int, int]:
+    if start_epoch_idx > stage_epochs:
+        print(
+            f"Skipping stage={stage_tag}: resume start epoch {start_epoch_idx} exceeds configured "
+            f"stage_epochs={stage_epochs}."
+        )
+        return global_step, data_points_seen, next_data_point_checkpoint
+
     scheduler = None
-    total_updates = _estimate_stage_total_updates(args, tokenizer, selected_datasets, stage_epochs)
+    remaining_stage_epochs = (stage_epochs - start_epoch_idx) + 1
+    total_updates = _estimate_stage_total_updates(args, tokenizer, selected_datasets, remaining_stage_epochs)
     warmup_steps = int(total_updates * args.warmup_ratio)
     if total_updates > 0:
         scheduler = build_warmup_decay_scheduler(
@@ -1019,7 +1087,7 @@ def run_stage(
             f"Scheduler configured: type={args.lr_scheduler} total_updates={total_updates} "
             f"warmup_steps={warmup_steps}"
         )
-    for epoch_idx in range(1, stage_epochs + 1):
+    for epoch_idx in range(start_epoch_idx, stage_epochs + 1):
         print(f"=== {stage_tag} epoch {epoch_idx}/{stage_epochs} ===")
         if args.dataset_strategy == "mix":
             mixed_loader = get_mixed_loader(args, tokenizer, selected_datasets)
@@ -1193,7 +1261,26 @@ def main() -> None:
             print(f"Initialized online_bias to {args.mc_online_bias_init:.4f}")
     else:
         raise ValueError(f"Unsupported model type: {args.model_type}")
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_id, cache_dir=args.cache_dir)
+
+    if args.resume_from_checkpoint:
+        ckpt_dir = Path(args.resume_from_checkpoint)
+        weights_path = ckpt_dir / "pytorch_model.bin"
+        if not ckpt_dir.exists():
+            raise FileNotFoundError(f"--resume-from-checkpoint does not exist: {ckpt_dir}")
+        if not weights_path.exists():
+            raise FileNotFoundError(f"Checkpoint weights not found: {weights_path}")
+        print(f"Loading checkpoint weights from {weights_path}")
+        state_dict = torch.load(weights_path, map_location=device)
+        model.load_state_dict(state_dict)
+        print("Checkpoint weights loaded.")
+
+    tokenizer_source = args.tokenizer_id
+    if args.resume_from_checkpoint:
+        ckpt_dir = Path(args.resume_from_checkpoint)
+        if (ckpt_dir / "tokenizer.json").exists() or (ckpt_dir / "tokenizer_config.json").exists():
+            tokenizer_source = str(ckpt_dir)
+            print(f"Loading tokenizer from checkpoint dir: {ckpt_dir}")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, cache_dir=args.cache_dir)
     tokenizer.pad_token = tokenizer.eos_token
 
     selected_datasets = normalize_dataset_choice(args.train_datasets)
@@ -1202,8 +1289,52 @@ def main() -> None:
     global_step = 0
     data_points_seen = 0
     next_data_point_checkpoint = args.data_point_checkpoint_interval
+    resume_stage = None
+    resume_epoch = 0
+    if args.resume_from_checkpoint:
+        resume_ckpt_dir = Path(args.resume_from_checkpoint)
+        ckpt_meta = _read_checkpoint_meta(resume_ckpt_dir)
+        resume_stage, resume_epoch = _resolve_resume_stage_epoch(resume_ckpt_dir, ckpt_meta)
+        if "global_step" in ckpt_meta:
+            try:
+                global_step = int(ckpt_meta["global_step"])
+            except ValueError:
+                print(f"Warning: invalid global_step in checkpoint meta: {ckpt_meta['global_step']}")
+        if "data_points" in ckpt_meta:
+            try:
+                data_points_seen = int(ckpt_meta["data_points"])
+            except ValueError:
+                print(f"Warning: invalid data_points in checkpoint meta: {ckpt_meta['data_points']}")
+        if args.data_point_checkpoint_interval > 0:
+            next_data_point_checkpoint = (
+                (data_points_seen // args.data_point_checkpoint_interval) + 1
+            ) * args.data_point_checkpoint_interval
+        print(
+            f"Resuming counters from checkpoint: global_step={global_step}, "
+            f"data_points_seen={data_points_seen}, next_checkpoint={next_data_point_checkpoint}"
+        )
+        if resume_stage is not None:
+            print(f"Resume stage info: stage={resume_stage}, epoch={resume_epoch}")
+        else:
+            print("Resume stage info: not found in checkpoint metadata or directory name.")
 
-    if args.freeze_epochs > 0:
+    freeze_start_epoch = 1
+    full_start_epoch = 1
+    skip_freeze_stage = False
+    if args.resume_from_checkpoint and resume_stage in {"freeze", "full"}:
+        if resume_stage == "freeze":
+            if _checkpoint_is_data_point_ckpt(Path(args.resume_from_checkpoint)):
+                freeze_start_epoch = max(1, resume_epoch)
+            else:
+                freeze_start_epoch = max(1, resume_epoch + 1)
+        elif resume_stage == "full":
+            skip_freeze_stage = True
+            if _checkpoint_is_data_point_ckpt(Path(args.resume_from_checkpoint)):
+                full_start_epoch = max(1, resume_epoch)
+            else:
+                full_start_epoch = max(1, resume_epoch + 1)
+
+    if args.freeze_epochs > 0 and not skip_freeze_stage:
         policy_model_name, trainable_names, frozen_names = configure_stage1_trainability_by_model_name(model, args)
         print(f"Freeze stage model policy applied: {policy_model_name}")
         print(f"Freeze stage trainable params count: {len(trainable_names)}")
@@ -1223,10 +1354,13 @@ def main() -> None:
             selected_datasets=selected_datasets,
             stage_tag="freeze",
             stage_epochs=args.freeze_epochs,
+            start_epoch_idx=freeze_start_epoch,
             global_step=global_step,
             data_points_seen=data_points_seen,
             next_data_point_checkpoint=next_data_point_checkpoint,
         )
+    elif skip_freeze_stage:
+        print("Skipping freeze stage because resume checkpoint is from full stage.")
 
     if args.full_finetune_epochs > 0:
         unfreeze_all_params(model)
@@ -1241,6 +1375,7 @@ def main() -> None:
             selected_datasets=selected_datasets,
             stage_tag="full",
             stage_epochs=args.full_finetune_epochs,
+            start_epoch_idx=full_start_epoch,
             global_step=global_step,
             data_points_seen=data_points_seen,
             next_data_point_checkpoint=next_data_point_checkpoint,
