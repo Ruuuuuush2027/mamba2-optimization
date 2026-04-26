@@ -55,7 +55,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Normalize PIQA continuation log-prob by continuation token count.",
     )
+    parser.add_argument("--skip-wikitext", action="store_true", help="Skip Wikitext Perplexity evaluation.")
     parser.add_argument("--skip-piqa", action="store_true", help="Skip PIQA evaluation.")
+    parser.add_argument("--skip-hellaswag", action="store_true", help="Skip HellaSwag evaluation.")
+    parser.add_argument("--hellaswag-split", type=str, default="validation")
+    parser.add_argument("--max-hellaswag-samples", type=int, default=0, help="0 means evaluate full split")
+    parser.add_argument("--skip-arc", action="store_true", help="Skip ARC-Challenge evaluation.")
+    parser.add_argument("--arc-config", type=str, default="ARC-Challenge")
+    parser.add_argument("--arc-split", type=str, default="validation")
+    parser.add_argument("--max-arc-samples", type=int, default=0, help="0 means evaluate full split")
 
     # Long-context Needle-In-A-Haystack (NIAH) settings.
     parser.add_argument("--skip-niah", action="store_true", help="Skip long-context NIAH benchmark.")
@@ -337,6 +345,78 @@ def run_piqa_accuracy(model, tokenizer, device, args) -> float:
     return acc
 
 
+def run_hellaswag_accuracy(model, tokenizer, device, args) -> float:
+    print(f"Running HellaSwag (split={args.hellaswag_split})...")
+    dataset = load_dataset("hellaswag", split=args.hellaswag_split, cache_dir=args.cache_dir)
+    if args.max_hellaswag_samples > 0:
+        dataset = dataset.select(range(min(args.max_hellaswag_samples, len(dataset))))
+
+    correct = 0
+    total = len(dataset)
+    progress = tqdm(total=total, desc="HellaSwag", unit="ex")
+    for i, example in enumerate(dataset, start=1):
+        ctx = example.get("ctx", "")
+        if not ctx:
+            ctx = f"{example.get('ctx_a', '').strip()} {example.get('ctx_b', '').strip()}".strip()
+        if example.get("activity_label"):
+            ctx = f"{example['activity_label']}: {ctx}".strip()
+
+        endings = example["endings"]
+        scores = [
+            score_text_logprob(
+                model, tokenizer, device, ctx, ending, length_normalize=args.piqa_length_normalize
+            )
+            for ending in endings
+        ]
+        pred = int(max(range(len(scores)), key=lambda k: scores[k]))
+        gold = int(example["label"])
+        if pred == gold:
+            correct += 1
+        progress.update(1)
+        progress.set_postfix(acc=f"{(correct / i):.4f}")
+    progress.close()
+
+    acc = correct / total if total > 0 else 0.0
+    print(f"HellaSwag Accuracy: {acc:.6f}")
+    return acc
+
+
+def run_arc_accuracy(model, tokenizer, device, args) -> float:
+    print(f"Running ARC ({args.arc_config}, split={args.arc_split})...")
+    dataset = load_dataset("ai2_arc", args.arc_config, split=args.arc_split, cache_dir=args.cache_dir)
+    if args.max_arc_samples > 0:
+        dataset = dataset.select(range(min(args.max_arc_samples, len(dataset))))
+
+    correct = 0
+    total = len(dataset)
+    progress = tqdm(total=total, desc="ARC", unit="ex")
+    for i, example in enumerate(dataset, start=1):
+        question = example["question"]
+        prefix = f"Question: {question}\nAnswer:"
+
+        choices = example["choices"]["text"]
+        choice_labels = example["choices"]["label"]
+        gold_label = str(example["answerKey"]).strip()
+
+        scores = [
+            score_text_logprob(
+                model, tokenizer, device, prefix, choice_text, length_normalize=args.piqa_length_normalize
+            )
+            for choice_text in choices
+        ]
+        pred_idx = int(max(range(len(scores)), key=lambda k: scores[k]))
+        pred_label = str(choice_labels[pred_idx]).strip()
+        if pred_label == gold_label:
+            correct += 1
+        progress.update(1)
+        progress.set_postfix(acc=f"{(correct / i):.4f}")
+    progress.close()
+
+    acc = correct / total if total > 0 else 0.0
+    print(f"ARC Accuracy: {acc:.6f}")
+    return acc
+
+
 def _make_needle_code(rng: random.Random) -> str:
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "".join(rng.choice(alphabet) for _ in range(8))
@@ -432,11 +512,22 @@ def main() -> None:
     print(f"Using device: {device}")
 
     model, tokenizer = load_model_and_tokenizer(args, device)
-    run_wikitext_perplexity(model, tokenizer, device, args)
+    if args.skip_wikitext:
+        print("Skipping Wikitext Perplexity (--skip-wikitext set).")
+    else:
+        run_wikitext_perplexity(model, tokenizer, device, args)
     if args.skip_piqa:
         print("Skipping PIQA (--skip-piqa set).")
     else:
         run_piqa_accuracy(model, tokenizer, device, args)
+    if args.skip_hellaswag:
+        print("Skipping HellaSwag (--skip-hellaswag set).")
+    else:
+        run_hellaswag_accuracy(model, tokenizer, device, args)
+    if args.skip_arc:
+        print("Skipping ARC (--skip-arc set).")
+    else:
+        run_arc_accuracy(model, tokenizer, device, args)
     if args.skip_niah:
         print("Skipping NIAH (--skip-niah set.")
     else:

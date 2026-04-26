@@ -173,7 +173,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--wikitext-target-tokens",
         type=int,
-        default=4_000_000,
+        default=20_000_000,
         help="Optional token cap for WikiText train text collection. 0 means no token cap.",
     )
 
@@ -186,7 +186,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fineweb-target-tokens",
         type=int,
-        default=8_500_000,
+        default=34_000_000,
         help="Target number of tokenizer tokens to collect from FineWeb train stream.",
     )
     parser.add_argument(
@@ -686,7 +686,7 @@ def load_our_select_model(
     detach_cached_segments: bool,
 ):
     try:
-        from mc_select import Mamba2MCSelectLMHeadModel
+        from mamba2_mc_select import Mamba2MCSelectLMHeadModel
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
             "Failed to import mc_select dependencies. Install requirements first: pip install -r requirements.txt"
