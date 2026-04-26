@@ -10,7 +10,7 @@ A minimal, single-file implementation of the Mamba-2 model in PyTorch.
 
 Mamba is a new class of foundation models, most notable for _not_ being based on the Transformer architecture. Instead it is in the family of State Space Models (SSMs) that maps a sequence through a hidden state in the fashion of RNNs. This approach enables linear scaling in computation and memory with respect to sequence length during training (unlike transformer's quadratic complexity), as well as constant time per step during inference. Mamba-2 builds upon Mamba-1 by imposing additional constraints on certain SSM parameters, allowing it to have much larger state dimensions and significantly improved training speed.
 
-This implementation is device agnostic and have been tested to work on the CPU and MPS (Metal Performance Shaders) backends. The model's output logits follow the same distribution as the reference implementation but are not numerically equivalent. 
+This implementation contains both original Mamba2 and Mamba2MC where we implemented a hidden state cache to try to improve performance.
 
 ## Some codes:
 - run inference_test using checkpoints: `python inference_test.py --model-type "Mamba2MC" --checkpoint-dir "./checkpoints/mamba2-finetune/Mamba2MC-final"`
