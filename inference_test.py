@@ -7,6 +7,7 @@ from transformers import AutoTokenizer
 
 from mamba2 import Mamba2LMHeadModel
 from mamba2_mc import Mamba2MCLMHeadModel
+from mc_select import Mamba2MCSelectLMHeadModel
 
 
 def get_device() -> torch.device:
@@ -19,7 +20,7 @@ def get_device() -> torch.device:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Inference test for Mamba2/Mamba2MC checkpoints.")
-    parser.add_argument("--model-type", type=str, default="Mamba2", choices=["Mamba2", "Mamba2MC"])
+    parser.add_argument("--model-type", type=str, default="Mamba2", choices=["Mamba2", "Mamba2MC", "Mamba2MCSelect"])
     parser.add_argument("--model-id", type=str, default="state-spaces/mamba2-1.3b")
     parser.add_argument("--tokenizer-id", type=str, default="EleutherAI/gpt-neox-20b")
     parser.add_argument("--cache-dir", type=str, default="./huggingface_cache")
@@ -40,6 +41,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mc-segment-size", type=int, default=64)
     parser.add_argument("--mc-max-cached-segments", type=int, default=16)
     parser.add_argument("--mc-backprop-history", action="store_true")
+    parser.add_argument("--mc-select-keep-top-k", type=int, default=8)
+    parser.add_argument("--mc-select-score-threshold", type=float, default=-1.0)
     return parser.parse_args()
 
 
@@ -48,13 +51,24 @@ def load_model(args: argparse.Namespace, device: torch.device):
         model = Mamba2LMHeadModel.from_pretrained(
             args.model_id, device=device, cache_dir=args.cache_dir
         )
-    else:
+    elif args.model_type == "Mamba2MC":
         model = Mamba2MCLMHeadModel.from_pretrained(
             args.model_id,
             device=device,
             cache_dir=args.cache_dir,
             segment_size=args.mc_segment_size,
             max_cached_segments=args.mc_max_cached_segments,
+            detach_cached_segments=(not args.mc_backprop_history),
+        )
+    else:
+        model = Mamba2MCSelectLMHeadModel.from_pretrained(
+            args.model_id,
+            device=device,
+            cache_dir=args.cache_dir,
+            segment_size=args.mc_segment_size,
+            max_cached_segments=args.mc_max_cached_segments,
+            keep_top_k=args.mc_select_keep_top_k,
+            score_threshold=args.mc_select_score_threshold,
             detach_cached_segments=(not args.mc_backprop_history),
         )
 

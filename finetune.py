@@ -116,6 +116,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--mc-select-keep-top-k",
+        type=int,
+        default=8,
+        help="For Mamba2MCSelect: keep top-k scored cached segments when cache overflows. 0 means keep all.",
+    )
+    parser.add_argument(
+        "--mc-select-score-threshold",
+        type=float,
+        default=-1.0,
+        help="For Mamba2MCSelect: discard cached segments with score lower than this threshold during pruning.",
+    )
+    parser.add_argument(
         "--dataloader-num-workers",
         type=int,
         default=4,
@@ -593,6 +605,7 @@ def _is_mc_specific_trainable_param(name: str) -> bool:
         or name.endswith(".W")
         or "mc_weight_matrix" in name
         or "online_bias" in name
+        or "select_score" in name
     )
 
 
@@ -607,7 +620,7 @@ def configure_stage1_trainability_by_model_name(model, args) -> tuple[str, list[
         # Current request: for the current Mamba2 model, keep all params trainable.
         for _, param in model.named_parameters():
             param.requires_grad = True
-    elif model_name == "Mamba2MCLMHeadModel":
+    elif model_name in {"Mamba2MCLMHeadModel", "Mamba2MCSelectLMHeadModel"}:
         # Freeze-stage policy for MC model is configurable.
         for name, param in model.named_parameters():
             if args.mc_freeze_train_mode == "mc_only":
@@ -658,6 +671,35 @@ def load_our_model(
         cache_dir=cache_dir,
         segment_size=segment_size,
         max_cached_segments=max_cached_segments,
+        detach_cached_segments=detach_cached_segments,
+    )
+
+
+def load_our_select_model(
+    model_id: str,
+    device,
+    cache_dir: str,
+    segment_size: int,
+    max_cached_segments: int,
+    keep_top_k: int,
+    score_threshold: float,
+    detach_cached_segments: bool,
+):
+    try:
+        from mc_select import Mamba2MCSelectLMHeadModel
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Failed to import mc_select dependencies. Install requirements first: pip install -r requirements.txt"
+        ) from exc
+
+    return Mamba2MCSelectLMHeadModel.from_pretrained(
+        model_id,
+        device=device,
+        cache_dir=cache_dir,
+        segment_size=segment_size,
+        max_cached_segments=max_cached_segments,
+        keep_top_k=keep_top_k,
+        score_threshold=score_threshold,
         detach_cached_segments=detach_cached_segments,
     )
 
@@ -797,7 +839,7 @@ def _checkpoint_is_data_point_ckpt(ckpt_dir: Path) -> bool:
 
 
 def _is_mc_model(model) -> bool:
-    return model.__class__.__name__ == "Mamba2MCLMHeadModel"
+    return model.__class__.__name__ in {"Mamba2MCLMHeadModel", "Mamba2MCSelectLMHeadModel"}
 
 
 def _is_mc_only_trainable(model) -> bool:
@@ -1202,7 +1244,7 @@ def main() -> None:
         raise ValueError("--mc-segment-size must be > 0.")
     if args.mc_segment_size > args.block_size:
         raise ValueError("--mc-segment-size should be <= --block-size.")
-    if args.model_type == "Mamba2MC" and args.freeze_epochs > 0 and args.mc_segment_size >= args.block_size:
+    if args.model_type in {"Mamba2MC", "Mamba2MCSelect"} and args.freeze_epochs > 0 and args.mc_segment_size >= args.block_size:
         raise ValueError(
             "For Mamba2MC freeze stage, --mc-segment-size must be < --block-size so MC params influence logits."
         )
@@ -1220,10 +1262,12 @@ def main() -> None:
         raise ValueError("--fineweb-target-tokens must be > 0.")
     if not (0.0 < args.val_fraction_of_train <= 1.0):
         raise ValueError("--val-fraction-of-train must be in (0, 1].")
-    if args.model_type == "Mamba2MC" and not (0.0 <= args.mc_online_bias_init <= 2.0):
+    if args.model_type in {"Mamba2MC", "Mamba2MCSelect"} and not (0.0 <= args.mc_online_bias_init <= 2.0):
         print(
             f"Warning: --mc-online-bias-init={args.mc_online_bias_init} is outside the recommended 0-2 range."
         )
+    if args.mc_select_keep_top_k < 0:
+        raise ValueError("--mc-select-keep-top-k must be >= 0.")
 
     torch.manual_seed(args.seed)
     device = get_device()
@@ -1253,6 +1297,22 @@ def main() -> None:
             cache_dir=args.cache_dir,
             segment_size=args.mc_segment_size,
             max_cached_segments=args.mc_max_cached_segments,
+            detach_cached_segments=(not args.mc_backprop_history),
+        )
+        if hasattr(model, "online_bias"):
+            with torch.no_grad():
+                model.online_bias.fill_(args.mc_online_bias_init)
+            print(f"Initialized online_bias to {args.mc_online_bias_init:.4f}")
+    elif args.model_type == 'Mamba2MCSelect':
+        print("Loading Ours (Selective Cache)")
+        model = load_our_select_model(
+            args.model_id,
+            device=device,
+            cache_dir=args.cache_dir,
+            segment_size=args.mc_segment_size,
+            max_cached_segments=args.mc_max_cached_segments,
+            keep_top_k=args.mc_select_keep_top_k,
+            score_threshold=args.mc_select_score_threshold,
             detach_cached_segments=(not args.mc_backprop_history),
         )
         if hasattr(model, "online_bias"):
@@ -1339,7 +1399,7 @@ def main() -> None:
         print(f"Freeze stage model policy applied: {policy_model_name}")
         print(f"Freeze stage trainable params count: {len(trainable_names)}")
         print(f"Freeze stage frozen params count: {len(frozen_names)}")
-        if args.model_type == "Mamba2MC" and len(trainable_names) <= 2:
+        if args.model_type in {"Mamba2MC", "Mamba2MCSelect"} and len(trainable_names) <= 2:
             raise ValueError(
                 "Mamba2MC freeze stage has <=2 trainable params under current --mc-freeze-train-mode. "
                 "Use --mc-freeze-train-mode mc_plus_norm (recommended), all, or set --freeze-epochs 0."
