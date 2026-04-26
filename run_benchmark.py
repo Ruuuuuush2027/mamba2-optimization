@@ -94,11 +94,14 @@ dataset = load_dataset("piqa", split="validation", trust_remote_code=True)
 
 def score(text):
     inputs = tokenizer(text, return_tensors="pt").to(device)
-
+    input_ids = inputs["input_ids"]
     with torch.no_grad():
-        logits, _ = model(inputs["input_ids"])
-
-    return logits.mean().item()
+        logits, _ = model(input_ids)
+    shift_logits = logits[:, :-1]
+    shift_labels = input_ids[:, 1:]
+    log_probs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
+    token_log_probs = log_probs.gather(2, shift_labels.unsqueeze(-1)).squeeze(-1)
+    return token_log_probs.sum().item()
 
 correct = 0
 
