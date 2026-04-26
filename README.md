@@ -14,4 +14,5 @@ This implementation is device agnostic and have been tested to work on the CPU a
 
 ## Some codes:
 - run inference_test using checkpoints: `python inference_test.py --model-type "Mamba2MC" --checkpoint-dir "./checkpoints/mamba2-finetune/Mamba2MC-final"`
-- run finetune: `python finetune.py --model-type "Mamba2MC"` or just Mamba2 `python finetune.py --model-type "Mamba2" --freeze-epochs 0`
+- run finetune: `python finetune.py --model-type "Mamba2MC"` or just Mamba2 `python finetune.py --model-type "Mamba2" --freeze-epochs 0` + `--resume-from-checkpoint "RESUME_PATH"` if need to continue finetuning from a checkpoint
+- run benchmark: `python run_benchmark.py --model-type Mamba2 --checkpoint-path "YOUR_PATH"`

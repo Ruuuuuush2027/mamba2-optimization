@@ -153,12 +153,31 @@ def run_wikitext_perplexity(model, tokenizer, device, args) -> float:
 def score_text_logprob(model, tokenizer, device, text: str) -> float:
     inputs = tokenizer(text, return_tensors="pt").to(device)
     input_ids = inputs["input_ids"]
+    attention_mask = inputs.get("attention_mask")
+
+    # Mamba2 implementation expects seq_len to be divisible by chunk_size.
+    chunk_size = getattr(getattr(model, "args", None), "chunk_size", 64)
+    seq_len = input_ids.size(1)
+    remainder = seq_len % chunk_size
+    if remainder != 0:
+        pad_len = chunk_size - remainder
+        pad_token_id = tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+        input_ids = F.pad(input_ids, (0, pad_len), value=pad_token_id)
+        if attention_mask is None:
+            attention_mask = torch.ones((1, seq_len), dtype=torch.long, device=device)
+        attention_mask = F.pad(attention_mask, (0, pad_len), value=0)
+
     with torch.no_grad():
         logits, _ = model(input_ids)
     shift_logits = logits[:, :-1]
     shift_labels = input_ids[:, 1:]
     log_probs = F.log_softmax(shift_logits, dim=-1)
     token_log_probs = log_probs.gather(2, shift_labels.unsqueeze(-1)).squeeze(-1)
+    if attention_mask is not None:
+        # Exclude padded positions from sequence score.
+        token_log_probs = token_log_probs * attention_mask[:, 1:].to(token_log_probs.dtype)
     return token_log_probs.sum().item()
 
 
@@ -241,7 +260,7 @@ def main() -> None:
     print(f"Using device: {device}")
 
     model, tokenizer = load_model_and_tokenizer(args, device)
-    run_wikitext_perplexity(model, tokenizer, device, args)
+    # run_wikitext_perplexity(model, tokenizer, device, args)
     if args.skip_piqa:
         print("Skipping PIQA (--skip-piqa set).")
     else:
