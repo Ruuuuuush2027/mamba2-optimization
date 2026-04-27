@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id", type=str, default="state-spaces/mamba2-1.3b")
     parser.add_argument("--tokenizer-id", type=str, default="EleutherAI/gpt-neox-20b")
     parser.add_argument("--cache-dir", type=str, default="./huggingface_cache")
-    parser.add_argument("--output-dir", type=str, default="./checkpoints/mamba2-finetune")
+    parser.add_argument("--output-dir", type=str, default="./checkpoints/mamba2-finetune-54M")
     parser.add_argument(
         "--train-datasets",
         nargs="+",
