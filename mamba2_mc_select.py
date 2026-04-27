@@ -72,6 +72,8 @@ class Mamba2MCSelectLMHeadModel(nn.Module):
         self.select_score = nn.Linear(args.d_model, 1, bias=True, device=device)
         nn.init.zeros_(self.select_score.weight)
         nn.init.zeros_(self.select_score.bias)
+        # Learnable scale for how strongly selector scores bias history attention.
+        self.select_score_mix_weight = nn.Parameter(torch.tensor(1.0, device=device))
 
     def _forward_backbone_full(self, input_ids: LongTensor) -> tuple[Tensor, list[InferenceCache]]:
         x = self.backbone.embedding(input_ids)
@@ -134,7 +136,13 @@ class Mamba2MCSelectLMHeadModel(nn.Module):
         )
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
 
-        allowed_missing = {"W", "online_bias", "select_score.weight", "select_score.bias"}
+        allowed_missing = {
+            "W",
+            "online_bias",
+            "select_score.weight",
+            "select_score.bias",
+            "select_score_mix_weight",
+        }
         unresolved_missing = set(missing_keys) - allowed_missing
         if unresolved_missing:
             raise RuntimeError(
@@ -170,6 +178,9 @@ class Mamba2MCSelectLMHeadModel(nn.Module):
         history = torch.stack(cache.segment_buffer, dim=1)
         query = hidden_t @ self.W
         scores = torch.einsum("bd,bnd->bn", query, history) / math.sqrt(self.args.d_model)
+        if cache.segment_scores:
+            selector_bias = torch.stack(cache.segment_scores).view(1, -1)
+            scores = scores + (self.select_score_mix_weight * selector_bias)
         ratios = F.softmax(scores, dim=-1)
         weighted_hist = torch.einsum("bn,bnd->bd", ratios, history)
 
@@ -260,6 +271,9 @@ class Mamba2MCSelectLMHeadModel(nn.Module):
                     history = torch.stack(segment_buffer, dim=1)
                     query = torch.matmul(hidden_chunk, self.W)
                     scores = torch.einsum("bld,bnd->bln", query, history) / math.sqrt(self.args.d_model)
+                    if segment_scores:
+                        selector_bias = torch.stack(segment_scores).view(1, 1, -1)
+                        scores = scores + (self.select_score_mix_weight * selector_bias)
                     ratios = F.softmax(scores, dim=-1)
                     weighted_hist = torch.einsum("bln,bnd->bld", ratios, history)
                     mixed_chunk = gate * hidden_chunk + (1.0 - gate) * weighted_hist

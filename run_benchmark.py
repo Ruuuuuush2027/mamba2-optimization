@@ -122,7 +122,10 @@ def load_our_select_model(
     score_threshold: float,
     detach_cached_segments: bool,
 ):
-    from mc_select import Mamba2MCSelectLMHeadModel
+    try:
+        from mamba2_mc_select import Mamba2MCSelectLMHeadModel
+    except ModuleNotFoundError:
+        from mc_select import Mamba2MCSelectLMHeadModel
 
     return Mamba2MCSelectLMHeadModel.from_pretrained(
         model_id,

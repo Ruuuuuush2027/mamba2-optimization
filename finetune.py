@@ -688,9 +688,12 @@ def load_our_select_model(
     try:
         from mamba2_mc_select import Mamba2MCSelectLMHeadModel
     except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "Failed to import mc_select dependencies. Install requirements first: pip install -r requirements.txt"
-        ) from exc
+        try:
+            from mc_select import Mamba2MCSelectLMHeadModel
+        except ModuleNotFoundError:
+            raise ModuleNotFoundError(
+                "Failed to import mamba2_mc_select dependencies. Install requirements first: pip install -r requirements.txt"
+            ) from exc
 
     return Mamba2MCSelectLMHeadModel.from_pretrained(
         model_id,

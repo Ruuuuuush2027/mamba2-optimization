@@ -7,7 +7,10 @@ from transformers import AutoTokenizer
 
 from mamba2 import Mamba2LMHeadModel
 from mamba2_mc import Mamba2MCLMHeadModel
-from mc_select import Mamba2MCSelectLMHeadModel
+try:
+    from mamba2_mc_select import Mamba2MCSelectLMHeadModel
+except ModuleNotFoundError:
+    from mc_select import Mamba2MCSelectLMHeadModel
 
 
 def get_device() -> torch.device:
