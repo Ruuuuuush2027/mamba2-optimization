@@ -5,6 +5,7 @@ import math
 import os
 import re
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +22,53 @@ def get_device() -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def _wandb_run_name(args) -> str:
+    return f"{args.model_type}-freeze{args.freeze_epochs}-finetune{args.full_finetune_epochs}"
+
+
+def wandb_enabled_from_env() -> bool:
+    return bool(os.getenv("WANDB_APIKEY") or os.getenv("WANDB_API_KEY"))
+
+
+def init_wandb_run(args):
+    # Support user-provided key naming: WANDB_APIKEY="..."
+    api_key = os.getenv("WANDB_API_KEY") or os.getenv("WANDB_APIKEY")
+    if not api_key:
+        return None
+    os.environ["WANDB_API_KEY"] = api_key
+
+    try:
+        import wandb
+    except ModuleNotFoundError:
+        print("W&B disabled: package 'wandb' is not installed.")
+        return None
+
+    run_name = _wandb_run_name(args)
+    try:
+        run = wandb.init(
+            project="567-mamba-finetune",
+            name=run_name,
+            config=vars(args),
+        )
+        print(f"W&B initialized: project=567-mamba-finetune run={run_name}")
+        return run
+    except Exception as exc:
+        print(f"Warning: failed to initialize W&B ({exc}). Continuing without W&B.")
+        return None
+
+
+def wandb_log(run: Any, payload: dict, step: int | None = None) -> None:
+    if run is None:
+        return
+    try:
+        if step is None:
+            run.log(payload)
+        else:
+            run.log(payload, step=step)
+    except Exception as exc:
+        print(f"Warning: W&B log failed ({exc}).")
 
 
 def parse_args() -> argparse.Namespace:
@@ -884,6 +932,7 @@ def train_one_epoch(
     val_loader=None,
     val_dataset_tag: str | None = None,
     val_loaders: list[tuple[str, DataLoader]] | None = None,
+    wandb_run=None,
 ) -> tuple[int, int, int]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -963,6 +1012,19 @@ def train_one_epoch(
                 f"data_points={data_points_seen} loss={avg_loss:.4f} "
                 f"ppl={ppl:.3e} lr={lr:.2e}"
             )
+            wandb_log(
+                wandb_run,
+                {
+                    "train/loss": avg_loss,
+                    "train/ppl": ppl,
+                    "train/lr": lr,
+                    "train/data_points": data_points_seen,
+                    "train/stage": stage_tag,
+                    "train/dataset": dataset_tag,
+                    "train/epoch": epoch_idx,
+                },
+                step=global_step,
+            )
             progress.set_postfix_str(f"loss={avg_loss:.4f}")
             running_loss = torch.zeros((), device=device)
             running_loss_batches = 0
@@ -994,6 +1056,18 @@ def train_one_epoch(
                 print(
                     f"Validation | dataset={eval_name} data_points={data_points_seen} "
                     f"loss={val_loss:.4f} ppl={val_ppl:.3e}"
+                )
+                val_key = re.sub(r"[^A-Za-z0-9_.-]", "_", str(eval_name))
+                wandb_log(
+                    wandb_run,
+                    {
+                        f"val/{val_key}/loss": val_loss,
+                        f"val/{val_key}/ppl": val_ppl,
+                        "val/data_points": data_points_seen,
+                        "val/stage": stage_tag,
+                        "val/epoch": epoch_idx,
+                    },
+                    step=global_step,
                 )
             while data_points_seen >= next_val_checkpoint:
                 next_val_checkpoint += val_interval
@@ -1109,6 +1183,7 @@ def run_stage(
     global_step: int,
     data_points_seen: int,
     next_data_point_checkpoint: int,
+    wandb_run=None,
 ) -> tuple[int, int, int]:
     if start_epoch_idx > stage_epochs:
         print(
@@ -1140,9 +1215,23 @@ def run_stage(
             if args.run_initial_validation:
                 for val_name, val_loader in val_loaders:
                     val_loss = evaluate(model, val_loader, device, args)
+                    val_ppl = perplexity_from_loss(val_loss)
                     print(
                         f"Validation | dataset={val_name} data_points={data_points_seen} "
-                        f"loss={val_loss:.4f} ppl={perplexity_from_loss(val_loss):.3e}"
+                        f"loss={val_loss:.4f} ppl={val_ppl:.3e}"
+                    )
+                    val_key = re.sub(r"[^A-Za-z0-9_.-]", "_", str(val_name))
+                    wandb_log(
+                        wandb_run,
+                        {
+                            f"val/{val_key}/loss": val_loss,
+                            f"val/{val_key}/ppl": val_ppl,
+                            "val/data_points": data_points_seen,
+                            "val/stage": stage_tag,
+                            "val/epoch": epoch_idx,
+                            "val/is_initial": 1,
+                        },
+                        step=global_step,
                     )
             global_step, data_points_seen, next_data_point_checkpoint = train_one_epoch(
                 model,
@@ -1160,6 +1249,7 @@ def run_stage(
                 stage_epochs=stage_epochs,
                 scheduler=scheduler,
                 val_loaders=val_loaders,
+                wandb_run=wandb_run,
             )
             save_stage_checkpoint(model, tokenizer, args, stage_tag, epoch_idx, "mixed")
         else:
@@ -1176,9 +1266,23 @@ def run_stage(
                 val_loader = _build_val_loader_for_dataset(args, tokenizer, dataset_name)
                 if args.run_initial_validation:
                     val_loss = evaluate(model, val_loader, device, args)
+                    val_ppl = perplexity_from_loss(val_loss)
                     print(
                         f"Validation | dataset={dataset_name} data_points={data_points_seen} "
-                        f"loss={val_loss:.4f} ppl={perplexity_from_loss(val_loss):.3e}"
+                        f"loss={val_loss:.4f} ppl={val_ppl:.3e}"
+                    )
+                    val_key = re.sub(r"[^A-Za-z0-9_.-]", "_", str(dataset_name))
+                    wandb_log(
+                        wandb_run,
+                        {
+                            f"val/{val_key}/loss": val_loss,
+                            f"val/{val_key}/ppl": val_ppl,
+                            "val/data_points": data_points_seen,
+                            "val/stage": stage_tag,
+                            "val/epoch": epoch_idx,
+                            "val/is_initial": 1,
+                        },
+                        step=global_step,
                     )
 
                 global_step, data_points_seen, next_data_point_checkpoint = train_one_epoch(
@@ -1198,6 +1302,7 @@ def run_stage(
                     scheduler=scheduler,
                     val_loader=val_loader,
                     val_dataset_tag=dataset_name,
+                    wandb_run=wandb_run,
                 )
                 save_stage_checkpoint(model, tokenizer, args, stage_tag, epoch_idx, dataset_name)
     return global_step, data_points_seen, next_data_point_checkpoint
@@ -1240,6 +1345,7 @@ def _estimate_stage_total_updates(args, tokenizer, selected_datasets: list[str],
 
 def main() -> None:
     args = parse_args()
+    wandb_run = None
 
     if args.block_size % 64 != 0:
         raise ValueError("--block-size should be a multiple of 64 to match Mamba2 chunking.")
@@ -1348,6 +1454,7 @@ def main() -> None:
 
     selected_datasets = normalize_dataset_choice(args.train_datasets)
     print(f"Selected datasets: {selected_datasets}")
+    wandb_run = init_wandb_run(args) if wandb_enabled_from_env() else None
 
     global_step = 0
     data_points_seen = 0
@@ -1421,6 +1528,7 @@ def main() -> None:
             global_step=global_step,
             data_points_seen=data_points_seen,
             next_data_point_checkpoint=next_data_point_checkpoint,
+            wandb_run=wandb_run,
         )
     elif skip_freeze_stage:
         print("Skipping freeze stage because resume checkpoint is from full stage.")
@@ -1442,6 +1550,7 @@ def main() -> None:
             global_step=global_step,
             data_points_seen=data_points_seen,
             next_data_point_checkpoint=next_data_point_checkpoint,
+            wandb_run=wandb_run,
         )
 
     final_dir = Path(args.output_dir) / f"{args.model_type}-final"
@@ -1449,6 +1558,20 @@ def main() -> None:
     torch.save(model.state_dict(), final_dir / "pytorch_model.bin")
     tokenizer.save_pretrained(final_dir)
     print(f"Training complete. Final model saved to {final_dir}")
+    wandb_log(
+        wandb_run,
+        {
+            "final/global_step": global_step,
+            "final/data_points": data_points_seen,
+            "final/checkpoint_dir": str(final_dir),
+        },
+        step=global_step,
+    )
+    if wandb_run is not None:
+        try:
+            wandb_run.finish()
+        except Exception as exc:
+            print(f"Warning: W&B finish failed ({exc}).")
 
 
 if __name__ == "__main__":
