@@ -232,7 +232,12 @@ class Mamba2MCSelectLMHeadModel(nn.Module):
         cache.current_segment_sum = torch.zeros_like(cache.current_segment_sum)
         cache.current_segment_len = 0
 
-    def step(self, input_ids: LongTensor, cache: MCSelectInferenceCache) -> tuple[Tensor, MCSelectInferenceCache]:
+    def step(
+        self,
+        input_ids: LongTensor,
+        cache: MCSelectInferenceCache,
+        return_logits: bool = True,
+    ) -> tuple[Tensor | None, MCSelectInferenceCache]:
         if input_ids.ndim != 2 or input_ids.shape[1] != 1:
             raise ValueError("step expects shape (batch, 1) input_ids")
 
@@ -243,8 +248,10 @@ class Mamba2MCSelectLMHeadModel(nn.Module):
 
         x = self.backbone.norm_f(x)
         hidden_t = x[:, 0, :]
-        mixed_hidden = self._weighted_history_mix(hidden_t, cache)
-        logits = self.lm_head(mixed_hidden).unsqueeze(1)
+        logits: Tensor | None = None
+        if return_logits:
+            mixed_hidden = self._weighted_history_mix(hidden_t, cache)
+            logits = self.lm_head(mixed_hidden).unsqueeze(1)
 
         self._update_segment_cache(hidden_t, cache)
         return logits, cache
@@ -320,6 +327,8 @@ class Mamba2MCSelectLMHeadModel(nn.Module):
         step_logits = []
         for pos in range(seqlen):
             logits_t, cache = self.step(input_ids[:, pos : pos + 1], cache)
+            if logits_t is None:
+                raise RuntimeError("step returned no logits during forward pass")
             step_logits.append(logits_t)
         logits = torch.cat(step_logits, dim=1)
         return logits, cache
@@ -339,7 +348,9 @@ class Mamba2MCSelectLMHeadModel(nn.Module):
 
         with torch.inference_mode():
             for i in range(prefix.shape[0]):
-                _, cache = self.step(prefix[i : i + 1].unsqueeze(0), cache)
+                _, cache = self.step(
+                    prefix[i : i + 1].unsqueeze(0), cache, return_logits=False
+                )
 
             for _ in range(max_new_length):
                 out, cache = self.step(tokens, cache)

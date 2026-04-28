@@ -125,8 +125,11 @@ class Mamba2LMHeadModel(nn.Module):
         return model
 
     def forward(
-        self, input_ids: LongTensor, h: list[InferenceCache] | list[None] | None = None
-    ) -> tuple[LongTensor, list[InferenceCache]]:
+        self,
+        input_ids: LongTensor,
+        h: list[InferenceCache] | list[None] | None = None,
+        return_logits: bool = True,
+    ) -> tuple[LongTensor | None, list[InferenceCache]]:
         """
         Arguments
             input_ids: (batch, seqlen) tokens from `EleutherAI/gpt-neox-20b` tokenizer
@@ -136,7 +139,7 @@ class Mamba2LMHeadModel(nn.Module):
                token.
 
         Return (logits, h)
-            logits: (batch, seqlen, vocab_size)
+            logits: (batch, seqlen, vocab_size) if return_logits else None
             h: updated inference cache after processing `input_ids`
         """
         seqlen = input_ids.shape[1]
@@ -150,8 +153,10 @@ class Mamba2LMHeadModel(nn.Module):
             x = y + x
 
         x = self.backbone.norm_f(x)
-        logits = self.lm_head(x)
-        return logits[:, :seqlen], cast(list[InferenceCache], h)
+        if return_logits:
+            logits = self.lm_head(x)
+            return logits[:, :seqlen], cast(list[InferenceCache], h)
+        return None, cast(list[InferenceCache], h)
 
     def generate(
         self,
@@ -171,14 +176,14 @@ class Mamba2LMHeadModel(nn.Module):
             # process the rest in multiple inference steps.
             n_chunked = (prefix.shape[0] // self.args.chunk_size) * self.args.chunk_size
             if n_chunked > 0:
-                _, h = self(prefix[:n_chunked].unsqueeze(0), None)
+                _, h = self(prefix[:n_chunked].unsqueeze(0), None, return_logits=False)
             else:
                 h = [
                     InferenceCache.alloc(1, self.args, device=self.device)
                     for _ in range(self.args.n_layer)
                 ]
             for i in range(n_chunked, prefix.shape[0]):
-                _, h = self(prefix[i : i + 1].unsqueeze(0), h)
+                _, h = self(prefix[i : i + 1].unsqueeze(0), h, return_logits=False)
 
             # Generate
             for _ in range(max_new_length):
