@@ -1,6 +1,7 @@
 import argparse
 import random
 import re
+import sys
 from pathlib import Path
 
 import torch
@@ -8,6 +9,15 @@ import torch.nn.functional as F
 from datasets import load_dataset, load_from_disk
 from tqdm import tqdm
 from transformers import AutoTokenizer
+
+from checkpoint_metadata import (
+    RUNTIME_ALIGNMENT_FIELDS,
+    align_args_with_checkpoint_geometry,
+    find_explicit_arg_dests,
+    parse_saved_training_geometry,
+    print_training_geometry,
+    read_checkpoint_meta,
+)
 
 
 def get_device() -> torch.device:
@@ -83,7 +93,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--niah-seed", type=int, default=42)
     parser.add_argument("--niah-max-new-tokens", type=int, default=16)
-    return parser.parse_args()
+    args = parser.parse_args()
+    args._explicit_dests = find_explicit_arg_dests(parser, sys.argv[1:])
+    return args
 
 
 def load_mamba2_model(model_id: str, device, cache_dir: str):
@@ -146,6 +158,18 @@ def load_model_and_tokenizer(args, device):
         raise FileNotFoundError(f"--checkpoint-path does not exist: {ckpt_dir}")
     if not weights_path.exists():
         raise FileNotFoundError(f"Checkpoint weights not found: {weights_path}")
+
+    ckpt_meta = read_checkpoint_meta(ckpt_dir)
+    saved_geometry = parse_saved_training_geometry(ckpt_meta)
+    print_training_geometry(saved_geometry)
+    align_args_with_checkpoint_geometry(
+        args,
+        ckpt_meta,
+        args._explicit_dests,
+        RUNTIME_ALIGNMENT_FIELDS,
+        print_fn=print,
+        context="benchmark runtime",
+    )
 
     print("Loading model...")
     if args.model_type == "Mamba2":

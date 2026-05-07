@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,17 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+
+from checkpoint_metadata import (
+    TRAINING_ALIGNMENT_FIELDS,
+    align_args_with_checkpoint_geometry,
+    collect_training_geometry,
+    find_explicit_arg_dests,
+    parse_saved_training_geometry,
+    print_training_geometry,
+    read_checkpoint_meta,
+    write_checkpoint_meta,
+)
 
 def get_device() -> torch.device:
     if torch.cuda.is_available():
@@ -50,7 +62,7 @@ def init_wandb_run(args):
         run = wandb.init(
             project="567-mamba-finetune",
             name=run_name,
-            config=vars(args),
+            config={k: v for k, v in vars(args).items() if not k.startswith("_")},
         )
         print(f"W&B initialized: project=567-mamba-finetune run={run_name}")
         return run
@@ -128,7 +140,12 @@ def parse_args() -> argparse.Namespace:
         help="LR schedule after warmup.",
     )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--block-size", type=int, default=128, help="Should be a multiple of 64 for this model.")
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=256,
+        help="Should be a multiple of 64. Default 256 gives MC/MCSelect at least 4 segments with mc-segment-size 64.",
+    )
     parser.add_argument(
         "--mc-segment-size",
         type=int,
@@ -221,7 +238,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--wikitext-target-tokens",
         type=int,
-        default=20_000_000,
+        default=10_000_000,
         help="Optional token cap for WikiText train text collection. 0 means no token cap.",
     )
 
@@ -234,7 +251,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fineweb-target-tokens",
         type=int,
-        default=34_000_000,
+        default=17_000_000,
         help="Target number of tokenizer tokens to collect from FineWeb train stream.",
     )
     parser.add_argument(
@@ -262,7 +279,173 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Path to a checkpoint directory containing pytorch_model.bin (and optional meta.txt/tokenizer files).",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    args._explicit_dests = find_explicit_arg_dests(parser, sys.argv[1:])
+    return args
+
+
+def _training_checkpoint_meta(
+    args,
+    *,
+    stage_tag: str | None = None,
+    epoch_idx: int | None = None,
+    data_points: int | None = None,
+    global_step: int | None = None,
+) -> dict[str, Any]:
+    meta = collect_training_geometry(args)
+    if stage_tag is not None:
+        meta["stage"] = stage_tag
+    if epoch_idx is not None:
+        meta["epoch"] = epoch_idx
+    if data_points is not None:
+        meta["data_points"] = data_points
+    if global_step is not None:
+        meta["global_step"] = global_step
+    return meta
+
+
+def _mc_segments_per_sample(args) -> int:
+    return args.block_size // args.mc_segment_size
+
+
+def _mc_training_has_selector_signal(args) -> bool:
+    return args.model_type in {"Mamba2MC", "Mamba2MCSelect"} and _mc_segments_per_sample(args) >= 3
+
+
+def _print_effective_training_geometry(args) -> None:
+    print("\n=== Training Geometry ===")
+    print(f"model_type: {args.model_type}")
+    print(f"block_size: {args.block_size}")
+    if args.model_type not in {"Mamba2MC", "Mamba2MCSelect"}:
+        return
+
+    segments_per_sample = _mc_segments_per_sample(args)
+    print(f"mc_segment_size: {args.mc_segment_size}")
+    print(f"segments_per_sample: {segments_per_sample}")
+    print(f"mc_max_cached_segments: {args.mc_max_cached_segments}")
+    if args.model_type == "Mamba2MCSelect":
+        print(f"mc_select_keep_top_k: {args.mc_select_keep_top_k}")
+        print(f"mc_select_score_threshold: {args.mc_select_score_threshold}")
+        print(
+            "Signal note: online_bias affects the second segment; "
+            "W, select_score, and select_score_mix_weight get nontrivial signal once a third segment exists."
+        )
+    else:
+        print(
+            "Signal note: online_bias affects the second segment; "
+            "W gets nontrivial signal once a third segment exists."
+        )
+
+
+def _validate_training_geometry(args) -> None:
+    if args.model_type not in {"Mamba2MC", "Mamba2MCSelect"}:
+        return
+
+    segments_per_sample = _mc_segments_per_sample(args)
+    if segments_per_sample < 3:
+        raise ValueError(
+            "Mamba2MC/Mamba2MCSelect need at least 3 full segments per packed training sample "
+            "to give W/select_score a real training signal. "
+            f"Current geometry: block_size={args.block_size}, mc_segment_size={args.mc_segment_size}, "
+            f"segments_per_sample={segments_per_sample}. "
+            "Use a larger --block-size (recommended: --block-size 256 with --mc-segment-size 64)."
+        )
+
+
+def _signal_param_names_for_model(model) -> tuple[str, ...]:
+    model_name = model.__class__.__name__
+    if model_name == "Mamba2MCLMHeadModel":
+        return ("W", "online_bias")
+    if model_name == "Mamba2MCSelectLMHeadModel":
+        return (
+            "W",
+            "online_bias",
+            "select_score.weight",
+            "select_score.bias",
+            "select_score_mix_weight",
+        )
+    return ()
+
+
+def _new_signal_tracker(param_names: tuple[str, ...]) -> dict[str, float]:
+    return {name: 0.0 for name in param_names}
+
+
+def _accumulate_signal_grad_norms(model, tracker: dict[str, float]) -> None:
+    if not tracker:
+        return
+    named_params = dict(model.named_parameters())
+    for name in tracker:
+        param = named_params.get(name)
+        if param is None or param.grad is None:
+            continue
+        grad_norm = float(param.grad.detach().float().norm().item())
+        if grad_norm > tracker[name]:
+            tracker[name] = grad_norm
+
+
+def _log_signal_diagnostics(
+    model,
+    tracker: dict[str, float],
+    *,
+    stage_tag: str,
+    epoch_idx: int,
+    global_step: int,
+    data_points_seen: int,
+    wandb_run=None,
+    interval_tag: str = "interval",
+) -> None:
+    if not tracker:
+        return
+
+    named_params = dict(model.named_parameters())
+    parts = []
+    payload: dict[str, float | int | str] = {
+        "signal/stage": stage_tag,
+        "signal/epoch": epoch_idx,
+        "signal/data_points": data_points_seen,
+    }
+    for name, max_grad_norm in tracker.items():
+        param = named_params.get(name)
+        if param is None:
+            continue
+        param_norm = float(param.detach().float().norm().item())
+        safe_name = name.replace(".", "_")
+        parts.append(
+            f"{name}: norm={param_norm:.6f}, max_grad_norm={max_grad_norm:.6e}"
+        )
+        payload[f"signal/{safe_name}/norm"] = param_norm
+        payload[f"signal/{safe_name}/max_grad_norm"] = max_grad_norm
+
+    if parts:
+        print(
+            f"Signal diagnostics ({interval_tag}) | stage={stage_tag} epoch={epoch_idx} "
+            f"step={global_step} data_points={data_points_seen} | "
+            + " | ".join(parts)
+        )
+        wandb_log(wandb_run, payload, step=global_step)
+
+
+def _warn_for_missing_signal(
+    model,
+    tracker: dict[str, float],
+    args,
+) -> None:
+    if not tracker or not _mc_training_has_selector_signal(args):
+        return
+
+    model_name = model.__class__.__name__
+    if model_name == "Mamba2MCSelectLMHeadModel":
+        if tracker.get("select_score.weight", 0.0) == 0.0 and tracker.get("select_score.bias", 0.0) == 0.0:
+            print(
+                "Warning: select_score gradients stayed at zero for the first full logging interval. "
+                "The selector head is likely not receiving a useful training signal."
+            )
+    elif model_name == "Mamba2MCLMHeadModel" and tracker.get("W", 0.0) == 0.0:
+        print(
+            "Warning: W gradients stayed at zero for the first full logging interval. "
+            "The MC history mixer is likely not receiving a useful training signal."
+        )
 
 
 def tokenize_and_pack_text_dataset(text_dataset: Dataset, tokenizer, block_size: int) -> Dataset:
@@ -820,6 +1003,7 @@ def perplexity_from_loss(loss_value: float) -> float:
 def save_data_point_checkpoint(
     model,
     tokenizer,
+    args,
     checkpoint_dir: str,
     data_points_mark: int,
     stage_tag: str,
@@ -831,26 +1015,21 @@ def save_data_point_checkpoint(
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), ckpt_dir / "pytorch_model.bin")
     tokenizer.save_pretrained(ckpt_dir)
-    meta_path = ckpt_dir / "meta.txt"
-    meta_path.write_text(
-        f"stage={stage_tag}\nepoch={epoch_idx}\ndata_points={data_points_mark}\nglobal_step={global_step}\n",
-        encoding="utf-8",
+    write_checkpoint_meta(
+        ckpt_dir / "meta.txt",
+        _training_checkpoint_meta(
+            args,
+            stage_tag=stage_tag,
+            epoch_idx=epoch_idx,
+            data_points=data_points_mark,
+            global_step=global_step,
+        ),
     )
     print(f"Saved data-point checkpoint to {ckpt_dir}")
 
 
 def _read_checkpoint_meta(ckpt_dir: Path) -> dict[str, str]:
-    meta_path = ckpt_dir / "meta.txt"
-    if not meta_path.exists():
-        return {}
-    values: dict[str, str] = {}
-    for raw_line in meta_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key.strip()] = value.strip()
-    return values
+    return read_checkpoint_meta(ckpt_dir)
 
 
 def _parse_checkpoint_stage_epoch_from_dirname(ckpt_dir: Path) -> tuple[str | None, int | None]:
@@ -954,6 +1133,9 @@ def train_one_epoch(
         else None
     )
     trainable_params = [p for p in model.parameters() if p.requires_grad]
+    signal_param_names = _signal_param_names_for_model(model)
+    signal_grad_tracker = _new_signal_tracker(signal_param_names)
+    warned_about_missing_signal = False
 
     print(
         f"Training 1 epoch | stage={stage_tag} dataset={dataset_tag}: batches={num_batches}, "
@@ -982,6 +1164,7 @@ def train_one_epoch(
             )
         loss = loss / args.grad_accum_steps
         loss.backward()
+        _accumulate_signal_grad_norms(model, signal_grad_tracker)
         # Keep logging in true per-batch loss units (not grad-accum scaled units).
         running_loss = running_loss + (loss.detach() * args.grad_accum_steps)
         running_loss_batches += 1
@@ -1025,9 +1208,22 @@ def train_one_epoch(
                 },
                 step=global_step,
             )
+            _log_signal_diagnostics(
+                model,
+                signal_grad_tracker,
+                stage_tag=stage_tag,
+                epoch_idx=epoch_idx,
+                global_step=global_step,
+                data_points_seen=data_points_seen,
+                wandb_run=wandb_run,
+            )
+            if not warned_about_missing_signal:
+                _warn_for_missing_signal(model, signal_grad_tracker, args)
+                warned_about_missing_signal = True
             progress.set_postfix_str(f"loss={avg_loss:.4f}")
             running_loss = torch.zeros((), device=device)
             running_loss_batches = 0
+            signal_grad_tracker = _new_signal_tracker(signal_param_names)
             while data_points_seen >= next_train_log_checkpoint:
                 next_train_log_checkpoint += args.log_every_data_points
 
@@ -1036,6 +1232,7 @@ def train_one_epoch(
                 save_data_point_checkpoint(
                     model=model,
                     tokenizer=tokenizer,
+                    args=args,
                     checkpoint_dir=args.checkpoint_dir,
                     data_points_mark=next_data_point_checkpoint,
                     stage_tag=stage_tag,
@@ -1072,6 +1269,20 @@ def train_one_epoch(
             while data_points_seen >= next_val_checkpoint:
                 next_val_checkpoint += val_interval
             model.train()
+
+    if signal_param_names and (running_loss_batches > 0 or any(value > 0.0 for value in signal_grad_tracker.values())):
+        _log_signal_diagnostics(
+            model,
+            signal_grad_tracker,
+            stage_tag=stage_tag,
+            epoch_idx=epoch_idx,
+            global_step=global_step,
+            data_points_seen=data_points_seen,
+            wandb_run=wandb_run,
+            interval_tag="epoch_tail",
+        )
+        if not warned_about_missing_signal:
+            _warn_for_missing_signal(model, signal_grad_tracker, args)
 
     return global_step, data_points_seen, next_data_point_checkpoint
 
@@ -1162,11 +1373,30 @@ def evaluate(model, val_loader, device, args) -> float:
     return avg_loss
 
 
-def save_stage_checkpoint(model, tokenizer, args, stage_tag: str, epoch_idx: int, dataset_name: str) -> None:
+def save_stage_checkpoint(
+    model,
+    tokenizer,
+    args,
+    stage_tag: str,
+    epoch_idx: int,
+    dataset_name: str,
+    data_points_seen: int,
+    global_step: int,
+) -> None:
     ckpt_dir = Path(args.output_dir) / f"{args.model_type}-{stage_tag}-epoch-{epoch_idx}-{dataset_name}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), ckpt_dir / "pytorch_model.bin")
     tokenizer.save_pretrained(ckpt_dir)
+    write_checkpoint_meta(
+        ckpt_dir / "meta.txt",
+        _training_checkpoint_meta(
+            args,
+            stage_tag=stage_tag,
+            epoch_idx=epoch_idx,
+            data_points=data_points_seen,
+            global_step=global_step,
+        ),
+    )
     print(f"Saved checkpoint to {ckpt_dir}")
 
 
@@ -1251,7 +1481,16 @@ def run_stage(
                 val_loaders=val_loaders,
                 wandb_run=wandb_run,
             )
-            save_stage_checkpoint(model, tokenizer, args, stage_tag, epoch_idx, "mixed")
+            save_stage_checkpoint(
+                model,
+                tokenizer,
+                args,
+                stage_tag,
+                epoch_idx,
+                "mixed",
+                data_points_seen,
+                global_step,
+            )
         else:
             for dataset_name in selected_datasets:
                 if dataset_name == "wikitext":
@@ -1304,7 +1543,16 @@ def run_stage(
                     val_dataset_tag=dataset_name,
                     wandb_run=wandb_run,
                 )
-                save_stage_checkpoint(model, tokenizer, args, stage_tag, epoch_idx, dataset_name)
+                save_stage_checkpoint(
+                    model,
+                    tokenizer,
+                    args,
+                    stage_tag,
+                    epoch_idx,
+                    dataset_name,
+                    data_points_seen,
+                    global_step,
+                )
     return global_step, data_points_seen, next_data_point_checkpoint
 
 
@@ -1346,6 +1594,23 @@ def _estimate_stage_total_updates(args, tokenizer, selected_datasets: list[str],
 def main() -> None:
     args = parse_args()
     wandb_run = None
+    resume_ckpt_meta: dict[str, str] = {}
+
+    if args.resume_from_checkpoint:
+        resume_ckpt_dir = Path(args.resume_from_checkpoint)
+        if not resume_ckpt_dir.exists():
+            raise FileNotFoundError(f"--resume-from-checkpoint does not exist: {resume_ckpt_dir}")
+        resume_ckpt_meta = _read_checkpoint_meta(resume_ckpt_dir)
+        saved_geometry = parse_saved_training_geometry(resume_ckpt_meta)
+        print_training_geometry(saved_geometry)
+        align_args_with_checkpoint_geometry(
+            args,
+            resume_ckpt_meta,
+            args._explicit_dests,
+            TRAINING_ALIGNMENT_FIELDS,
+            print_fn=print,
+            context="training",
+        )
 
     if args.block_size % 64 != 0:
         raise ValueError("--block-size should be a multiple of 64 to match Mamba2 chunking.")
@@ -1377,6 +1642,8 @@ def main() -> None:
         )
     if args.mc_select_keep_top_k < 0:
         raise ValueError("--mc-select-keep-top-k must be >= 0.")
+    _validate_training_geometry(args)
+    _print_effective_training_geometry(args)
 
     torch.manual_seed(args.seed)
     device = get_device()
@@ -1463,7 +1730,7 @@ def main() -> None:
     resume_epoch = 0
     if args.resume_from_checkpoint:
         resume_ckpt_dir = Path(args.resume_from_checkpoint)
-        ckpt_meta = _read_checkpoint_meta(resume_ckpt_dir)
+        ckpt_meta = resume_ckpt_meta or _read_checkpoint_meta(resume_ckpt_dir)
         resume_stage, resume_epoch = _resolve_resume_stage_epoch(resume_ckpt_dir, ckpt_meta)
         if "global_step" in ckpt_meta:
             try:
@@ -1557,6 +1824,15 @@ def main() -> None:
     final_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), final_dir / "pytorch_model.bin")
     tokenizer.save_pretrained(final_dir)
+    write_checkpoint_meta(
+        final_dir / "meta.txt",
+        _training_checkpoint_meta(
+            args,
+            stage_tag="final",
+            data_points=data_points_seen,
+            global_step=global_step,
+        ),
+    )
     print(f"Training complete. Final model saved to {final_dir}")
     wandb_log(
         wandb_run,

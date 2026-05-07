@@ -1,10 +1,20 @@
 import argparse
 import hashlib
 import re
+import sys
 from pathlib import Path
 
 import torch
 from transformers import AutoTokenizer
+
+from checkpoint_metadata import (
+    RUNTIME_ALIGNMENT_FIELDS,
+    align_args_with_checkpoint_geometry,
+    find_explicit_arg_dests,
+    parse_saved_training_geometry,
+    print_training_geometry,
+    read_checkpoint_meta,
+)
 
 from mamba2 import Mamba2LMHeadModel
 from mamba2_mc import Mamba2MCLMHeadModel
@@ -47,7 +57,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mc-backprop-history", action="store_true")
     parser.add_argument("--mc-select-keep-top-k", type=int, default=8)
     parser.add_argument("--mc-select-score-threshold", type=float, default=-1.0)
-    return parser.parse_args()
+    args = parser.parse_args()
+    args._explicit_dests = find_explicit_arg_dests(parser, sys.argv[1:])
+    return args
+
+
+def _align_runtime_args_from_checkpoint(args: argparse.Namespace) -> None:
+    ckpt_meta = read_checkpoint_meta(Path(args.checkpoint_dir))
+    saved_geometry = parse_saved_training_geometry(ckpt_meta)
+    print_training_geometry(saved_geometry)
+    align_args_with_checkpoint_geometry(
+        args,
+        ckpt_meta,
+        args._explicit_dests,
+        RUNTIME_ALIGNMENT_FIELDS,
+        print_fn=print,
+        context="runtime",
+    )
 
 
 def _file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -255,6 +281,7 @@ def main() -> None:
     args = parse_args()
     device = get_device()
     print(f"Using device: {device}")
+    _align_runtime_args_from_checkpoint(args)
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_id, cache_dir=args.cache_dir)
     tokenizer.pad_token_id = tokenizer.eos_token_id
