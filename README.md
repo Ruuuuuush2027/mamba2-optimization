@@ -13,6 +13,6 @@ Mamba is a new class of foundation models, most notable for _not_ being based on
 This implementation contains both original Mamba2 and Mamba2MC where we implemented a hidden state cache to try to improve performance.
 
 ## Some codes:
-- run inference_test using checkpoints: `python inference_test.py --model-type "Mamba2MC" --checkpoint-dir "./checkpoints/mamba2-finetune/Mamba2MC-final"`
+- run inference_test using checkpoints: `python inference_test.py --model-type "Mamba2MC" --checkpoint-dir "./checkpoints/mamba2-finetune/Mamba2MC-final" --prompt "Your prompt"`
 - run finetune: `python finetune.py --model-type "Mamba2MC"` or just Mamba2 `python finetune.py --model-type "Mamba2" --freeze-epochs 0` + `--resume-from-checkpoint "RESUME_PATH"` if need to continue finetuning from a checkpoint
 - run benchmark: `python run_benchmark.py --model-type Mamba2 --checkpoint-path "YOUR_PATH"`

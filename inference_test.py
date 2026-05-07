@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import re
 from pathlib import Path
 
@@ -34,7 +35,7 @@ def parse_args() -> argparse.Namespace:
         help="Directory containing pytorch_model.bin from fine-tuning.",
     )
     parser.add_argument("--prompt", type=str, default="Mamba is")
-    parser.add_argument("--max-new-length", type=int, default=128)
+    parser.add_argument("--max-new-length", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=30)
     parser.add_argument("--top-p", type=float, default=1.0)
@@ -47,6 +48,75 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mc-select-keep-top-k", type=int, default=8)
     parser.add_argument("--mc-select-score-threshold", type=float, default=-1.0)
     return parser.parse_args()
+
+
+def _file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _summarize_checkpoint_file(ckpt_path: Path) -> None:
+    size_mb = ckpt_path.stat().st_size / (1024 * 1024)
+    print("\n=== Checkpoint File ===")
+    print(f"path: {ckpt_path.resolve()}")
+    print(f"size_mb: {size_mb:.2f}")
+    print(f"sha256: {_file_sha256(ckpt_path)}")
+
+
+def _print_mc_parameter_summary(model, checkpoint_state_dict: dict[str, torch.Tensor]) -> None:
+    interesting_keys = [
+        "W",
+        "online_bias",
+        "select_score.weight",
+        "select_score.bias",
+        "select_score_mix_weight",
+    ]
+    print("\n=== MC Parameter Summary ===")
+    found_any = False
+    for key in interesting_keys:
+        if not hasattr(model, "state_dict"):
+            continue
+        model_state = model.state_dict()
+        if key not in model_state:
+            continue
+        found_any = True
+        tensor = model_state[key].detach().float().cpu()
+        was_in_checkpoint = key in checkpoint_state_dict
+        print(
+            f"{key}: in_checkpoint={was_in_checkpoint}, "
+            f"shape={tuple(tensor.shape)}, norm={tensor.norm().item():.6f}, "
+            f"mean={tensor.mean().item():.6f}, std={tensor.std().item() if tensor.numel() > 1 else 0.0:.6f}"
+        )
+    if not found_any:
+        print("No MC-specific parameters found on this model.")
+
+
+def _print_generation_activation_hint(model, tokenizer, args: argparse.Namespace) -> None:
+    if args.model_type not in {"Mamba2MC", "Mamba2MCSelect"}:
+        return
+    prompt_tokens = tokenizer(args.prompt, return_tensors="pt").input_ids.shape[1]
+    first_mc_token_index = max(1, args.mc_segment_size - prompt_tokens + 1)
+    print("\n=== MC Activation Hint ===")
+    print(
+        f"prompt_tokens={prompt_tokens}, mc_segment_size={args.mc_segment_size}, "
+        f"max_new_length={args.max_new_length}"
+    )
+    if first_mc_token_index > args.max_new_length:
+        print(
+            "MC history mixing never activates for this run. "
+            "Generation will behave like the base model for all produced tokens."
+        )
+    else:
+        print(
+            f"MC history mixing can first affect generated token #{first_mc_token_index}. "
+            "Earlier generated tokens should match if the shared base weights and sampling settings are the same."
+        )
 
 
 def load_model(args: argparse.Namespace, device: torch.device):
@@ -82,12 +152,16 @@ def load_model(args: argparse.Namespace, device: torch.device):
             "If you used the new finetune naming, try a folder like Mamba2-final or Mamba2MC-final."
         )
 
+    _summarize_checkpoint_file(ckpt_path)
     state_dict = torch.load(str(ckpt_path), map_location=device, weights_only=True)
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    print(f"checkpoint_tensor_count: {len(state_dict)}")
+    print(f"loaded_model_type: {model.__class__.__name__}")
     if missing_keys:
         print(f"Warning: missing keys while loading checkpoint: {missing_keys[:8]}")
     if unexpected_keys:
         print(f"Warning: unexpected keys while loading checkpoint: {unexpected_keys[:8]}")
+    _print_mc_parameter_summary(model, state_dict)
 
     model.eval()
     return model
@@ -186,6 +260,7 @@ def main() -> None:
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
     model = load_model(args, device)
+    _print_generation_activation_hint(model, tokenizer, args)
     sanity_check_checkpoint(model, tokenizer, args, device)
     text = generate_text(model, tokenizer, args, device)
     print("\n=== Generated Text ===")

@@ -7,3 +7,4 @@ wandb/
 *.job
 *.out
 *.zip
+carc_jobs_and_logs/
