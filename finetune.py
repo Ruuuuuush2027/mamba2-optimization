@@ -206,6 +206,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--debug-first-signal-batches",
+        type=int,
+        default=0,
+        help=(
+            "Print per-batch gradient diagnostics for W/selector params on the first N "
+            "training batches after backward. 0 disables."
+        ),
+    )
+    parser.add_argument(
         "--log-every-data-points",
         type=int,
         default=200,
@@ -367,6 +376,33 @@ def _signal_param_names_for_model(model) -> tuple[str, ...]:
     return ()
 
 
+def _verify_mc_checkpoint_keys(model) -> None:
+    required = _signal_param_names_for_model(model)
+    if not required:
+        return
+    state_dict = model.state_dict()
+    missing = [name for name in required if name not in state_dict]
+    if missing:
+        raise RuntimeError(
+            f"Refusing to save checkpoint because expected MC params are missing from state_dict: {missing}"
+        )
+
+
+def _print_signal_param_trainability(model) -> None:
+    param_names = _signal_param_names_for_model(model)
+    if not param_names:
+        return
+    named_params = dict(model.named_parameters())
+    state_dict = model.state_dict()
+    print("Signal parameter status:")
+    for name in param_names:
+        param = named_params.get(name)
+        print(
+            f"  {name}: in_state_dict={name in state_dict}, "
+            f"requires_grad={param.requires_grad if param is not None else False}"
+        )
+
+
 def _new_signal_tracker(param_names: tuple[str, ...]) -> dict[str, float]:
     return {name: 0.0 for name in param_names}
 
@@ -446,6 +482,105 @@ def _warn_for_missing_signal(
             "Warning: W gradients stayed at zero for the first full logging interval. "
             "The MC history mixer is likely not receiving a useful training signal."
         )
+
+
+def _print_step_signal_debug(
+    model,
+    *,
+    stage_tag: str,
+    dataset_tag: str,
+    epoch_idx: int,
+    batch_idx: int,
+    data_points_seen: int,
+    loss_value: float,
+) -> None:
+    param_names = _signal_param_names_for_model(model)
+    if not param_names:
+        return
+
+    named_params = dict(model.named_parameters())
+    parts = []
+    for name in param_names:
+        param = named_params.get(name)
+        if param is None:
+            parts.append(f"{name}: missing")
+            continue
+        grad = param.grad
+        if grad is None:
+            parts.append(f"{name}: grad=None")
+            continue
+        grad_norm = float(grad.detach().float().norm().item())
+        grad_max = float(grad.detach().float().abs().max().item())
+        parts.append(f"{name}: grad_norm={grad_norm:.6e}, grad_abs_max={grad_max:.6e}")
+
+    print(
+        f"Signal debug | stage={stage_tag} dataset={dataset_tag} epoch={epoch_idx} "
+        f"batch={batch_idx} data_points={data_points_seen} loss={loss_value:.6f} | "
+        + " | ".join(parts)
+    )
+
+
+def _save_training_bundle(
+    ckpt_dir: Path,
+    *,
+    optimizer: AdamW | None = None,
+    scheduler: LambdaLR | None = None,
+    scheduler_config: dict[str, Any] | None = None,
+    stage_tag: str | None = None,
+    epoch_idx: int | None = None,
+    dataset_tag: str | None = None,
+    batch_step: int | None = None,
+    global_step: int | None = None,
+    data_points_seen: int | None = None,
+    next_data_point_checkpoint: int | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "stage_tag": stage_tag,
+        "epoch_idx": epoch_idx,
+        "dataset_tag": dataset_tag,
+        "batch_step": batch_step,
+        "global_step": global_step,
+        "data_points_seen": data_points_seen,
+        "next_data_point_checkpoint": next_data_point_checkpoint,
+        "scheduler_config": scheduler_config,
+        "torch_rng_state": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        payload["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+    if optimizer is not None:
+        payload["optimizer_state_dict"] = optimizer.state_dict()
+    if scheduler is not None:
+        payload["scheduler_state_dict"] = scheduler.state_dict()
+    torch.save(payload, ckpt_dir / "training_state.pt")
+
+
+def _load_training_bundle(ckpt_dir: Path):
+    bundle_path = ckpt_dir / "training_state.pt"
+    if not bundle_path.exists():
+        return None
+    return torch.load(bundle_path, map_location="cpu", weights_only=False)
+
+
+def _move_optimizer_state_to_device(optimizer: AdamW, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
+
+
+def _restore_rng_state_from_bundle(resume_bundle) -> None:
+    if not resume_bundle:
+        return
+    torch_rng_state = resume_bundle.get("torch_rng_state")
+    if torch_rng_state is not None:
+        torch.set_rng_state(torch_rng_state)
+    cuda_rng_state_all = resume_bundle.get("cuda_rng_state_all")
+    if cuda_rng_state_all is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_rng_state_all)
+
+
+def _resume_bundle_matches_stage(resume_bundle, stage_tag: str) -> bool:
+    return bool(resume_bundle) and resume_bundle.get("stage_tag") == stage_tag
 
 
 def tokenize_and_pack_text_dataset(text_dataset: Dataset, tokenizer, block_size: int) -> Dataset:
@@ -1004,15 +1139,22 @@ def save_data_point_checkpoint(
     model,
     tokenizer,
     args,
+    optimizer,
+    scheduler,
+    scheduler_config,
     checkpoint_dir: str,
     data_points_mark: int,
     stage_tag: str,
     epoch_idx: int,
+    dataset_tag: str,
+    batch_step: int,
     model_type: str,
     global_step: int,
+    next_data_point_checkpoint: int,
 ) -> None:
     ckpt_dir = Path(checkpoint_dir) / f"{model_type}-data-points-{data_points_mark}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    _verify_mc_checkpoint_keys(model)
     torch.save(model.state_dict(), ckpt_dir / "pytorch_model.bin")
     tokenizer.save_pretrained(ckpt_dir)
     write_checkpoint_meta(
@@ -1024,6 +1166,19 @@ def save_data_point_checkpoint(
             data_points=data_points_mark,
             global_step=global_step,
         ),
+    )
+    _save_training_bundle(
+        ckpt_dir,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scheduler_config=scheduler_config,
+        stage_tag=stage_tag,
+        epoch_idx=epoch_idx,
+        dataset_tag=dataset_tag,
+        batch_step=batch_step,
+        global_step=global_step,
+        data_points_seen=data_points_mark,
+        next_data_point_checkpoint=next_data_point_checkpoint,
     )
     print(f"Saved data-point checkpoint to {ckpt_dir}")
 
@@ -1108,6 +1263,7 @@ def train_one_epoch(
     epoch_idx: int,
     stage_epochs: int,
     scheduler=None,
+    scheduler_config: dict[str, Any] | None = None,
     val_loader=None,
     val_dataset_tag: str | None = None,
     val_loaders: list[tuple[str, DataLoader]] | None = None,
@@ -1136,6 +1292,7 @@ def train_one_epoch(
     signal_param_names = _signal_param_names_for_model(model)
     signal_grad_tracker = _new_signal_tracker(signal_param_names)
     warned_about_missing_signal = False
+    debug_signal_batches_printed = 0
 
     print(
         f"Training 1 epoch | stage={stage_tag} dataset={dataset_tag}: batches={num_batches}, "
@@ -1165,6 +1322,21 @@ def train_one_epoch(
         loss = loss / args.grad_accum_steps
         loss.backward()
         _accumulate_signal_grad_norms(model, signal_grad_tracker)
+        if (
+            args.debug_first_signal_batches > 0
+            and debug_signal_batches_printed < args.debug_first_signal_batches
+            and signal_param_names
+        ):
+            _print_step_signal_debug(
+                model,
+                stage_tag=stage_tag,
+                dataset_tag=dataset_tag,
+                epoch_idx=epoch_idx,
+                batch_idx=step,
+                data_points_seen=data_points_seen,
+                loss_value=float((loss.detach() * args.grad_accum_steps).item()),
+            )
+            debug_signal_batches_printed += 1
         # Keep logging in true per-batch loss units (not grad-accum scaled units).
         running_loss = running_loss + (loss.detach() * args.grad_accum_steps)
         running_loss_batches += 1
@@ -1233,12 +1405,18 @@ def train_one_epoch(
                     model=model,
                     tokenizer=tokenizer,
                     args=args,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scheduler_config=scheduler_config,
                     checkpoint_dir=args.checkpoint_dir,
                     data_points_mark=next_data_point_checkpoint,
                     stage_tag=stage_tag,
                     epoch_idx=epoch_idx,
+                    dataset_tag=dataset_tag,
+                    batch_step=step,
                     model_type=args.model_type,
                     global_step=global_step,
+                    next_data_point_checkpoint=next_data_point_checkpoint + args.data_point_checkpoint_interval,
                 )
                 next_data_point_checkpoint += args.data_point_checkpoint_interval
 
@@ -1377,6 +1555,9 @@ def save_stage_checkpoint(
     model,
     tokenizer,
     args,
+    optimizer,
+    scheduler,
+    scheduler_config: dict[str, Any] | None,
     stage_tag: str,
     epoch_idx: int,
     dataset_name: str,
@@ -1385,6 +1566,7 @@ def save_stage_checkpoint(
 ) -> None:
     ckpt_dir = Path(args.output_dir) / f"{args.model_type}-{stage_tag}-epoch-{epoch_idx}-{dataset_name}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    _verify_mc_checkpoint_keys(model)
     torch.save(model.state_dict(), ckpt_dir / "pytorch_model.bin")
     tokenizer.save_pretrained(ckpt_dir)
     write_checkpoint_meta(
@@ -1396,6 +1578,19 @@ def save_stage_checkpoint(
             data_points=data_points_seen,
             global_step=global_step,
         ),
+    )
+    _save_training_bundle(
+        ckpt_dir,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scheduler_config=scheduler_config,
+        stage_tag=stage_tag,
+        epoch_idx=epoch_idx,
+        dataset_tag=dataset_name,
+        batch_step=None,
+        global_step=global_step,
+        data_points_seen=data_points_seen,
+        next_data_point_checkpoint=None,
     )
     print(f"Saved checkpoint to {ckpt_dir}")
 
@@ -1413,6 +1608,7 @@ def run_stage(
     global_step: int,
     data_points_seen: int,
     next_data_point_checkpoint: int,
+    resume_training_bundle=None,
     wandb_run=None,
 ) -> tuple[int, int, int]:
     if start_epoch_idx > stage_epochs:
@@ -1423,18 +1619,41 @@ def run_stage(
         return global_step, data_points_seen, next_data_point_checkpoint
 
     scheduler = None
+    scheduler_config: dict[str, Any] | None = None
     remaining_stage_epochs = (stage_epochs - start_epoch_idx) + 1
     total_updates = _estimate_stage_total_updates(args, tokenizer, selected_datasets, remaining_stage_epochs)
     warmup_steps = int(total_updates * args.warmup_ratio)
+    scheduler_name = args.lr_scheduler
+    if _resume_bundle_matches_stage(resume_training_bundle, stage_tag):
+        saved_scheduler_config = resume_training_bundle.get("scheduler_config") or {}
+        if saved_scheduler_config:
+            total_updates = int(saved_scheduler_config.get("total_updates", total_updates))
+            warmup_steps = int(saved_scheduler_config.get("warmup_steps", warmup_steps))
+            scheduler_name = str(saved_scheduler_config.get("scheduler_name", scheduler_name))
+            print(
+                f"Restoring scheduler geometry for stage={stage_tag}: "
+                f"type={scheduler_name} total_updates={total_updates} warmup_steps={warmup_steps}"
+            )
+    scheduler_config = {
+        "stage_tag": stage_tag,
+        "scheduler_name": scheduler_name,
+        "total_updates": total_updates,
+        "warmup_steps": warmup_steps,
+    }
     if total_updates > 0:
         scheduler = build_warmup_decay_scheduler(
             optimizer=optimizer,
             warmup_steps=warmup_steps,
             total_steps=total_updates,
-            scheduler_name=args.lr_scheduler,
+            scheduler_name=scheduler_name,
         )
+        if _resume_bundle_matches_stage(resume_training_bundle, stage_tag):
+            scheduler_state_dict = resume_training_bundle.get("scheduler_state_dict")
+            if scheduler_state_dict:
+                scheduler.load_state_dict(scheduler_state_dict)
+                print(f"Restored scheduler state for stage={stage_tag}.")
         print(
-            f"Scheduler configured: type={args.lr_scheduler} total_updates={total_updates} "
+            f"Scheduler configured: type={scheduler_name} total_updates={total_updates} "
             f"warmup_steps={warmup_steps}"
         )
     for epoch_idx in range(start_epoch_idx, stage_epochs + 1):
@@ -1478,6 +1697,7 @@ def run_stage(
                 epoch_idx=epoch_idx,
                 stage_epochs=stage_epochs,
                 scheduler=scheduler,
+                scheduler_config=scheduler_config,
                 val_loaders=val_loaders,
                 wandb_run=wandb_run,
             )
@@ -1485,6 +1705,9 @@ def run_stage(
                 model,
                 tokenizer,
                 args,
+                optimizer,
+                scheduler,
+                scheduler_config,
                 stage_tag,
                 epoch_idx,
                 "mixed",
@@ -1539,6 +1762,7 @@ def run_stage(
                     epoch_idx=epoch_idx,
                     stage_epochs=stage_epochs,
                     scheduler=scheduler,
+                    scheduler_config=scheduler_config,
                     val_loader=val_loader,
                     val_dataset_tag=dataset_name,
                     wandb_run=wandb_run,
@@ -1547,6 +1771,9 @@ def run_stage(
                     model,
                     tokenizer,
                     args,
+                    optimizer,
+                    scheduler,
+                    scheduler_config,
                     stage_tag,
                     epoch_idx,
                     dataset_name,
@@ -1595,12 +1822,14 @@ def main() -> None:
     args = parse_args()
     wandb_run = None
     resume_ckpt_meta: dict[str, str] = {}
+    resume_training_bundle = None
 
     if args.resume_from_checkpoint:
         resume_ckpt_dir = Path(args.resume_from_checkpoint)
         if not resume_ckpt_dir.exists():
             raise FileNotFoundError(f"--resume-from-checkpoint does not exist: {resume_ckpt_dir}")
         resume_ckpt_meta = _read_checkpoint_meta(resume_ckpt_dir)
+        resume_training_bundle = _load_training_bundle(resume_ckpt_dir)
         saved_geometry = parse_saved_training_geometry(resume_ckpt_meta)
         print_training_geometry(saved_geometry)
         align_args_with_checkpoint_geometry(
@@ -1647,6 +1876,7 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     device = get_device()
+    _restore_rng_state_from_bundle(resume_training_bundle)
 
     if device.type == "cuda":
         # Throughput-oriented CUDA defaults.
@@ -1697,6 +1927,8 @@ def main() -> None:
             print(f"Initialized online_bias to {args.mc_online_bias_init:.4f}")
     else:
         raise ValueError(f"Unsupported model type: {args.model_type}")
+    _verify_mc_checkpoint_keys(model)
+    _print_signal_param_trainability(model)
 
     if args.resume_from_checkpoint:
         ckpt_dir = Path(args.resume_from_checkpoint)
@@ -1726,6 +1958,7 @@ def main() -> None:
     global_step = 0
     data_points_seen = 0
     next_data_point_checkpoint = args.data_point_checkpoint_interval
+    optimizer = None
     resume_stage = None
     resume_epoch = 0
     if args.resume_from_checkpoint:
@@ -1746,6 +1979,8 @@ def main() -> None:
             next_data_point_checkpoint = (
                 (data_points_seen // args.data_point_checkpoint_interval) + 1
             ) * args.data_point_checkpoint_interval
+        if resume_training_bundle and resume_training_bundle.get("next_data_point_checkpoint") is not None:
+            next_data_point_checkpoint = int(resume_training_bundle["next_data_point_checkpoint"])
         print(
             f"Resuming counters from checkpoint: global_step={global_step}, "
             f"data_points_seen={data_points_seen}, next_checkpoint={next_data_point_checkpoint}"
@@ -1776,12 +2011,19 @@ def main() -> None:
         print(f"Freeze stage model policy applied: {policy_model_name}")
         print(f"Freeze stage trainable params count: {len(trainable_names)}")
         print(f"Freeze stage frozen params count: {len(frozen_names)}")
+        _print_signal_param_trainability(model)
         if args.model_type in {"Mamba2MC", "Mamba2MCSelect"} and len(trainable_names) <= 2:
             raise ValueError(
                 "Mamba2MC freeze stage has <=2 trainable params under current --mc-freeze-train-mode. "
                 "Use --mc-freeze-train-mode mc_plus_norm (recommended), all, or set --freeze-epochs 0."
             )
         optimizer = build_optimizer(model, args)
+        if _resume_bundle_matches_stage(resume_training_bundle, "freeze"):
+            optimizer_state_dict = resume_training_bundle.get("optimizer_state_dict")
+            if optimizer_state_dict:
+                optimizer.load_state_dict(optimizer_state_dict)
+                _move_optimizer_state_to_device(optimizer, device)
+                print("Restored optimizer state for stage=freeze.")
         global_step, data_points_seen, next_data_point_checkpoint = run_stage(
             model=model,
             tokenizer=tokenizer,
@@ -1795,6 +2037,7 @@ def main() -> None:
             global_step=global_step,
             data_points_seen=data_points_seen,
             next_data_point_checkpoint=next_data_point_checkpoint,
+            resume_training_bundle=resume_training_bundle,
             wandb_run=wandb_run,
         )
     elif skip_freeze_stage:
@@ -1803,7 +2046,14 @@ def main() -> None:
     if args.full_finetune_epochs > 0:
         unfreeze_all_params(model)
         print("Unfroze all model parameters for full fine-tuning stage.")
+        _print_signal_param_trainability(model)
         optimizer = build_optimizer(model, args)
+        if _resume_bundle_matches_stage(resume_training_bundle, "full"):
+            optimizer_state_dict = resume_training_bundle.get("optimizer_state_dict")
+            if optimizer_state_dict:
+                optimizer.load_state_dict(optimizer_state_dict)
+                _move_optimizer_state_to_device(optimizer, device)
+                print("Restored optimizer state for stage=full.")
         global_step, data_points_seen, next_data_point_checkpoint = run_stage(
             model=model,
             tokenizer=tokenizer,
@@ -1817,11 +2067,13 @@ def main() -> None:
             global_step=global_step,
             data_points_seen=data_points_seen,
             next_data_point_checkpoint=next_data_point_checkpoint,
+            resume_training_bundle=resume_training_bundle,
             wandb_run=wandb_run,
         )
 
     final_dir = Path(args.output_dir) / f"{args.model_type}-final"
     final_dir.mkdir(parents=True, exist_ok=True)
+    _verify_mc_checkpoint_keys(model)
     torch.save(model.state_dict(), final_dir / "pytorch_model.bin")
     tokenizer.save_pretrained(final_dir)
     write_checkpoint_meta(
@@ -1832,6 +2084,19 @@ def main() -> None:
             data_points=data_points_seen,
             global_step=global_step,
         ),
+    )
+    _save_training_bundle(
+        final_dir,
+        optimizer=optimizer,
+        scheduler=None,
+        scheduler_config=None,
+        stage_tag="final",
+        epoch_idx=None,
+        dataset_tag=None,
+        batch_step=None,
+        global_step=global_step,
+        data_points_seen=data_points_seen,
+        next_data_point_checkpoint=next_data_point_checkpoint,
     )
     print(f"Training complete. Final model saved to {final_dir}")
     wandb_log(
