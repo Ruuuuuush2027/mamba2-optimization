@@ -1,0 +1,209 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage{url}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+\begin{document}
+
+\title{Augmenting Mamba-2 with Explicit Memory Caching for Long-Context Recall\\
+{\footnotesize CSCI 567 - Machine Learning Project Proposal}
+}
+
+\author{
+    \IEEEauthorblockN{Jinglu Sun, Mo Jiang, Zhenglong Liu, and Zhiyuan Jin}
+    \IEEEauthorblockA{\textit{University of Southern California} \\
+    \{jinglusu, mojiang, zhenglon, jinzhiyu\}@usc.edu}
+}
+
+\maketitle
+
+\begin{abstract}
+State Space Models (SSMs) such as Mamba-2 deliver linear-time sequence modelling but compress all history into a fixed-size recurrent state, which is known to limit the exact recall of distant tokens relative to Transformer KV attention. We propose to investigate whether attaching an explicit, learnable \emph{memory cache} to a pre-trained Mamba-2 (1.3B) backbone can improve long-context recall without retraining the backbone from scratch. Two architectural variants will be implemented: a sliding-window segment cache (\textbf{Mamba2MC}) and a selective variant that retains only high-scoring segments (\textbf{Mamba2MCSelect}). New parameters will be trained on a $\sim$27M-token mix of WikiText and FineWeb using a staged freeze-then-finetune protocol, and the resulting models will be evaluated on WikiText perplexity, three zero-shot reasoning benchmarks (PIQA, HellaSwag, ARC), and a Needle-In-A-Haystack long-context retrieval task. The project will produce a self-contained PyTorch implementation, a controlled comparison against the pre-trained baseline, and an analysis of where memory caching helps SSMs and where it does not.
+\end{abstract}
+
+\begin{IEEEkeywords}
+State Space Models, Mamba-2, Memory Caching, Long-Context Recall, Selective Attention, Fine-tuning
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+\subsection{Research Objective and Core Question}
+
+This project investigates whether a pre-trained Structured State Space Model (SSM) can be augmented with an external memory cache to close the long-context recall gap between SSMs and Transformer attention. We focus on Mamba-2~\cite{dao2024transformersssmsgeneralizedmodels}, which models sequences via Structured State-Space Dual (SSD) dynamics rather than explicit attention. Our core research questions are:
+
+\begin{enumerate}
+    \item Can a simple segment-level memory cache, trained \emph{only as new parameters} on top of a frozen-then-finetuned Mamba-2 backbone, improve long-context recall?
+    \item Does adding a learned \emph{selection rule} on top of the cache (top-$K$ retention by a learned score) outperform a naive sliding-window cache?
+    \item Can either of these gains be achieved without harming the model's general language modelling and zero-shot reasoning quality?
+\end{enumerate}
+
+\subsection{Motivation and Project Significance}
+
+Transformer attention enables exact retrieval of past tokens, at a cost of $O(T)$ memory and $O(T^2)$ compute~\cite{tay2022efficienttransformerssurvey,fichtl2025endtransformerschallengingattention}. SSMs such as Mamba-2 offer linear-time sequence modelling by compressing history into a fixed-size recurrent state~\cite{dao2024transformersssmsgeneralizedmodels}, but this compression makes precise recall of distant tokens harder---an effect documented on associative-recall benchmarks like MQAR. Hybrid architectures such as Griffin~\cite{de2024griffinmixinggatedlinear} and Jamba~\cite{lieber2024jambahybridtransformermambalanguage} address this by interleaving attention layers, sacrificing the SSM's linear complexity. We instead study a lighter-weight intervention: keep the linear-time backbone, and bolt on a small explicit memory module trained as a parameter-efficient add-on, in the spirit of the Compressive Transformer's compressed memory~\cite{rae2019compressivetransformerslongrangesequence} and retrieval-augmented language models~\cite{lewis2021retrievalaugmentedgenerationknowledgeintensivenlp}.
+
+\section{Proposed Method}
+
+We propose two architectures that share the pretrained Mamba-2 backbone and differ only in how cached segments are retained.
+
+\subsection{Mamba2MC: Sliding-Window Segment Cache}
+
+After every $S$ tokens (the \emph{segment size}), we compute a segment hidden state $\bar h_k$ as the mean of the backbone's output hidden states within that window:
+\begin{equation}
+    \bar{h}_k = \frac{1}{S}\sum_{t=kS}^{(k+1)S-1} h_t.
+\end{equation}
+Up to $K_{\max}$ segments are retained (oldest evicted first). At each step the SSM hidden state $h_t$ is mixed with a softmax-weighted sum over the buffer:
+\begin{align}
+    q &= h_t W,\quad W \in \mathbb{R}^{d \times d}\\
+    \alpha_k &= \mathrm{softmax}_k\!\left(\frac{q\cdot \bar h_k}{\sqrt{d}}\right)\\
+    \tilde{h}_t &= \sigma(\beta)\, h_t + (1-\sigma(\beta))\sum_{k}\alpha_k\, \bar h_k
+\end{align}
+where $W$ is initialised to the identity and the gate $\beta$ is initialised to $8.0$ so $\sigma(\beta)\!\approx\!1$ at step 0 (i.e.\ the model behaves identically to the base Mamba-2 at the start of training).
+
+\subsection{Mamba2MCSelect: Selective Segment Retention}
+
+Mamba2MCSelect adds a learned per-segment importance score $s_k = \mathrm{score}(\bar h_k) \in \mathbb R$, where $\mathrm{score}(\cdot): \mathbb R^d \to \mathbb R$ is a linear layer initialised to zero. Two changes follow.
+
+\textbf{Cache update:} when the buffer is full, segments below a threshold $\tau$ are dropped, and the rest are sorted by score and truncated to the top $K\le K_{\max}$.
+
+\textbf{Score-biased attention:} the score is also injected into the per-segment attention logit, $\alpha_k = \mathrm{softmax}_k(q\cdot \bar h_k/\sqrt d + \lambda_{\text{select}}\, s_k)$, so segments that score higher are both more likely to be retained \emph{and} more likely to be attended to.
+
+\subsection{Training Protocol}
+
+We will use a two-stage curriculum to add new parameters to the pre-trained backbone without destabilising it:
+
+\begin{enumerate}
+    \item \textbf{Freeze stage:} the backbone is frozen; only the new MC parameters ($W$, $\beta$, scoring head, $\lambda_{\text{select}}$) are trained.
+    \item \textbf{Fine-tune stage:} all parameters are unfrozen and trained end-to-end.
+\end{enumerate}
+
+This curriculum lets the new modules learn to route into the cache before the pretrained weights start adapting.
+
+\section{Data}
+
+\subsection{Training Data}
+
+We will train on a mixture of two corpora, totalling $\sim$27M tokens:
+
+\begin{itemize}
+    \item \textbf{WikiText} ($\sim$10M tokens): clean, well-formed encyclopaedic English; used as a stable language-modelling signal.
+    \item \textbf{FineWeb} ($\sim$17M tokens, CC-MAIN-2024-10 subset): filtered Common Crawl text; provides distributional diversity.
+\end{itemize}
+
+\subsection{Evaluation Benchmarks}
+
+\begin{itemize}
+    \item \textbf{WikiText perplexity (PPL):} standard language-modelling metric.
+    \item \textbf{PIQA:} physical-intuition question answering.
+    \item \textbf{HellaSwag:} commonsense sentence completion.
+    \item \textbf{ARC:} AI2 Reasoning Challenge (easy + challenge accuracy combined).
+    \item \textbf{NIAH (Needle-In-A-Haystack):} long-context retrieval. A ``needle'' fact is injected into a long document and the model must retrieve it; accuracy is the fraction of correctly retrieved needles. This is the principal benchmark for measuring whether the cache mechanism actually improves long-context behaviour.
+\end{itemize}
+
+The first four metrics will allow us to detect any zero-shot reasoning regression introduced by fine-tuning, and the fifth metric will tell us whether the cache mechanism actually delivers on its design intent.
+
+\section{Models and Comparisons}
+
+We will compare three model variants, all 1.3B parameters, all sharing the same pre-trained Mamba-2 weights:
+
+\begin{itemize}
+    \item \textbf{Mamba-2 (baseline):} the unmodified pre-trained \texttt{state-spaces/mamba2-1.3b} checkpoint, used as the upper-bound reference for zero-shot reasoning and the starting point for fine-tuning.
+    \item \textbf{Mamba-2-MC:} the sliding-window memory-caching variant.
+    \item \textbf{Mamba-2-MCSelect:} the selective top-$K$ memory-caching variant.
+\end{itemize}
+
+A natural fourth point of comparison---fine-tuned Mamba-2 \emph{without} an MC module on the same data---is described as a planned ablation in Section~\ref{sec:ablations}.
+
+\section{Experimental Design}
+
+\subsection{Training Configuration}
+
+\begin{itemize}
+    \item \textbf{Hardware:} $1\times$ NVIDIA L40S GPU; $\approx 1$ day per model.
+    \item \textbf{Optimiser:} AdamW with learning rate $2\times 10^{-5}$, cosine scheduler, warmup ratio $0.01$, weight decay $0.01$, max grad norm $1.0$.
+    \item \textbf{Batch size:} 2; gradient accumulation 8 (effective batch 16).
+    \item \textbf{Training context length (\texttt{block\_size}):} $256$ tokens.
+    \item \textbf{Cache hyperparameters:} segment size $S=64$, max cached segments $K_{\max}=16$. For MCSelect: top-$K=8$, score threshold $\tau=-1.0$.
+\end{itemize}
+
+\subsection{Implementation Plan}
+
+The implementation will extend a minimal PyTorch Mamba-2 implementation with two parallel paths in \texttt{forward()}:
+
+\begin{itemize}
+    \item \textbf{Fast training/eval path:} runs the full-sequence backbone in parallel, then iterates over segment-sized chunks to update the cache and compute logits.
+    \item \textbf{Step-by-step inference path:} runs the backbone token by token, updating the SSM and segment caches incrementally.
+\end{itemize}
+
+We will also implement a metadata-alignment module so that cache hyperparameters are serialised alongside checkpoints and re-validated at inference time.
+
+\subsection{Evaluation Metrics}
+
+\begin{itemize}
+    \item \textbf{Language modelling:} WikiText perplexity.
+    \item \textbf{Zero-shot reasoning:} PIQA, HellaSwag, ARC accuracy.
+    \item \textbf{Long-context recall:} NIAH retrieval accuracy.
+    \item \textbf{Engineering:} training throughput, peak GPU memory, and per-checkpoint disk footprint.
+\end{itemize}
+
+\subsection{Ablations and Analysis}
+\label{sec:ablations}
+
+Our planned ablations directly probe the three research questions:
+
+\begin{itemize}
+    \item \textbf{Fine-tuned Mamba-2 without MC} (key baseline): same data, same optimiser, same epoch count, no MC module. This isolates the ``fine-tuning tax'' from any cost or benefit attributable to the cache itself.
+    \item \textbf{MCSelect vs MC}: holds backbone and data fixed, varies only the retention rule. Tests whether selective retention adds value over a sliding window.
+    \item \textbf{Cache hyperparameters:} sweep $S$, $K_{\max}$, top-$K$, and (if time permits) training context length, to characterise how much of the result is hyperparameter-sensitive.
+    \item \textbf{Initialisation:} compare $\beta\in\{0, 4, 8\}$, $W\in\{I, \mathcal{N}(0,\sigma^2)\}$, score $\in\{0, \mathcal{N}\}$ to verify the importance of the ``zero-effect at step 0'' principle.
+\end{itemize}
+
+\subsection{Success Criteria}
+
+We will consider the project successful if any of the following hold:
+
+\begin{itemize}
+    \item Mamba-2-MC or Mamba-2-MCSelect achieves higher NIAH accuracy than the pre-trained Mamba-2 baseline at matched compute.
+    \item Mamba-2-MCSelect outperforms Mamba-2-MC on NIAH by a margin larger than $\sim$3 accuracy points, demonstrating that selective retention adds measurable value over a sliding window.
+    \item PPL improves on the fine-tuning distribution without a $>1$-point regression on PIQA / HellaSwag / ARC, demonstrating that the cache does not hurt general capabilities.
+\end{itemize}
+
+We will also document negative results clearly: this is a small-scale fine-tune of a heavily pre-trained model, and a regression on zero-shot benchmarks is a likely outcome that itself carries informative content.
+
+\section{Project Timeline and Interim Milestones}
+
+The project is planned over 12 weeks.
+
+\textbf{Week 1--2: Literature review and environment setup.}
+Survey prior work on SSMs (Mamba-2 / SSD), associative-recall failures, hybrid SSM--attention architectures, and retrieval-augmented language models. Set up a single-GPU L40S environment, download the pre-trained Mamba-2 1.3B checkpoint, and verify that baseline forward passes match the upstream implementation.
+
+\textbf{Week 3--4: Core MC implementation.}
+Implement Mamba2MC with the fast-path / step-path duality. Verify numerical equivalence with base Mamba-2 at $\sigma(\beta)=1$ (a regression test for the ``zero-effect at step 0'' property). Land basic unit tests and a short training smoke test.
+
+\textbf{Week 5--6: MCSelect and metadata alignment.}
+Implement Mamba2MCSelect (scoring head, threshold + top-$K$ pruning, score-biased attention). Build the checkpoint metadata module so cache hyperparameters survive save/load.
+
+\textbf{Week 7--8: Data pipeline and staged training.}
+Build the WikiText + FineWeb data pipeline with token budgets ($\sim$10M + $\sim$17M). Run the staged freeze-then-finetune training for all three variants. Track $\sigma(\beta)$ and cache-attention statistics across training.
+
+\textbf{Week 9--10: Evaluation harness.}
+Implement evaluation for PPL, PIQA, HellaSwag, ARC, and NIAH. Run all benchmarks for the three trained models. Produce the comparison table.
+
+\textbf{Week 11: Analysis and ablations.}
+Conduct the ablations in Section~\ref{sec:ablations}, with priority on the fine-tuned-without-MC baseline. Analyse where the cache helps vs.\ hurts, and inspect the learned $\beta$, $W$, and score-head statistics.
+
+\textbf{Week 12: Final report.}
+Consolidate results, finalise figures and tables, and write the report.
+
+\section{Conclusion}
+
+This project will study whether an explicit, parameter-efficient memory cache can mitigate the long-context recall limitation of Mamba-2 without abandoning its linear-time backbone. By implementing both a sliding-window cache (Mamba2MC) and a selective top-$K$ variant (Mamba2MCSelect), training them with a staged freeze-then-finetune protocol on a $\sim$27M-token mix, and evaluating on a perplexity benchmark, three zero-shot reasoning tasks, and a long-context retrieval task, we aim to characterise where memory caching is a useful add-on for SSMs and where it is not. The expected deliverables are a self-contained PyTorch implementation, a controlled three-way model comparison, and an analysis identifying the data, context-length, and architectural prerequisites for memory-augmented SSMs to succeed.
+
+\bibliographystyle{ieeetr}
+\bibliography{references}
+\end{document}

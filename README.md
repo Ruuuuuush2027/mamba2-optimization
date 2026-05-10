@@ -9,9 +9,26 @@ We implemented and compared three models to test our hypothesis:
 2. **Mamba2MC (Memory Caching)**: We augment Mamba-2 with a hidden state cache. It periodically caches previous segment hidden states. During generation, it uses a learned projection matrix (`W`) and a scalar gate (`online_bias`) to compute a weighted mix of these historical segments, blending them with the current token's hidden state. This acts as a pseudo-attention mechanism over compressed historical chunks.
 3. **Mamba2MC_Select (Selective Memory Caching)**: A more advanced variant of the MC model. Instead of keeping a naive sliding window of recent segments, it introduces a scoring network (`select_score`). It scores each segment and retains only the top-K highest-scoring segments in the cache, allowing the model to hold onto important context for much longer sequences without blowing up memory.
 
-## Dataset & Training
+## Datasets
 
-**Dataset**: We used a mixed dataset consisting of **WikiText** and **FineWeb**. The total training budget was **~27M tokens**.
+All datasets used in this project are pre-existing public corpora; we did not collect or release a new dataset.
+
+**Training mix (~27M tokens total):**
+- **WikiText** (~10M tokens) — [https://huggingface.co/datasets/wikitext](https://huggingface.co/datasets/wikitext)
+- **FineWeb**, subset `CC-MAIN-2024-10` (~17M tokens, streamed) — [https://huggingface.co/datasets/HuggingFaceFW/fineweb](https://huggingface.co/datasets/HuggingFaceFW/fineweb)
+
+**Zero-shot evaluation benchmarks:**
+- **PIQA** — [https://huggingface.co/datasets/piqa](https://huggingface.co/datasets/piqa)
+- **HellaSwag** — [https://huggingface.co/datasets/Rowan/hellaswag](https://huggingface.co/datasets/Rowan/hellaswag)
+- **ARC** (Easy + Challenge) — [https://huggingface.co/datasets/allenai/ai2_arc](https://huggingface.co/datasets/allenai/ai2_arc)
+
+**Long-context evaluation:**
+- **NIAH** (Needle-In-A-Haystack) — generated synthetically at evaluation time by `run_benchmark.py`; haystack text and needle templates are defined inline in the script.
+
+**Pre-trained backbone:**
+- `state-spaces/mamba2-1.3b` — [https://huggingface.co/state-spaces/mamba2-1.3b](https://huggingface.co/state-spaces/mamba2-1.3b)
+
+## Training
 
 **Training Setup**:
 To properly train the newly initialized memory caching parameters without destroying the pre-trained Mamba-2 weights, we utilized a staged training approach:
